@@ -1389,6 +1389,29 @@ class Raptoreum(Coin):
     DAEMON = daemon.DashDaemon
     DESERIALIZER = lib_tx_dash.DeserializerDash
 
+    # RTM asset opcodes appended after standard P2PKH scripts
+    OP_CHECKSIG = 0xac
+    OP_ASSET_ID = 0xbc
+
+    @classmethod
+    def hashX_from_script(cls, script):
+        '''Strip RTM asset payload before hashing.
+
+        Asset transfer scripts are standard P2PKH with asset data appended
+        after OP_CHECKSIG:
+
+            <P2PKH script> OP_CHECKSIG OP_ASSET_ID <payload> OP_DROP OP_DROP
+
+        Stripping everything after OP_CHECKSIG produces the same hashX as
+        a regular P2PKH output to the same address, so asset transactions
+        appear in the address's normal history.
+        '''
+        marker = bytes([cls.OP_CHECKSIG, cls.OP_ASSET_ID])
+        idx = script.find(marker)
+        if idx != -1:
+            script = script[:idx + 1]  # keep through OP_CHECKSIG
+        return super().hashX_from_script(script)
+
 
 class RaptoreumTestnet(Raptoreum):
     SHORTNAME = "tRTM"
