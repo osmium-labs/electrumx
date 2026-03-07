@@ -1952,6 +1952,36 @@ class DashElectrumX(ElectrumX):
         return res
 
 
+class RaptoreumElectrumX(DashElectrumX):
+    '''A TCP server that handles incoming Electrum Raptoreum connections,
+    adding asset-aware RPC methods.'''
+
+    def set_request_handlers(self, ptuple):
+        super().set_request_handlers(ptuple)
+        self.request_handlers.update({
+            'blockchain.scripthash.listassets':
+                self.scripthash_listassets,
+        })
+
+    async def scripthash_listassets(self, scripthash):
+        '''Return asset UTXOs for a scripthash.
+
+        Returns a list of dicts with keys: tx_hash, tx_pos, height,
+        asset_id, flag, unique_id, amount.
+        '''
+        hashX = scripthash_to_hashX(scripthash)
+        asset_utxos = await self.db.all_asset_utxos(hashX)
+        self.bump_cost(1.0 + len(asset_utxos) / 50)
+        return [{'tx_hash': hash_to_hex_str(u.tx_hash),
+                 'tx_pos': u.tx_pos,
+                 'height': u.height,
+                 'asset_id': u.asset_id,
+                 'flag': u.flag,
+                 'unique_id': u.unique_id,
+                 'amount': u.amount}
+                for u in asset_utxos]
+
+
 class SmartCashElectrumX(DashElectrumX):
     '''A TCP server that handles incoming Electrum-SMART connections.'''
 

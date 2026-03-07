@@ -51,7 +51,8 @@ import electrumx.server.block_processor as block_proc
 import electrumx.server.daemon as daemon
 from electrumx.server.session import (ElectrumX, DashElectrumX,
                                       SmartCashElectrumX, AuxPoWElectrumX,
-                                      NameIndexElectrumX, NameIndexAuxPoWElectrumX)
+                                      NameIndexElectrumX, NameIndexAuxPoWElectrumX,
+                                      RaptoreumElectrumX)
 
 
 @dataclass(slots=True)
@@ -1385,13 +1386,14 @@ class Raptoreum(Coin):
     RPC_PORT = 10225
     REORG_LIMIT = 1000
     PEERS = []
-    SESSIONCLS = DashElectrumX
+    SESSIONCLS = RaptoreumElectrumX
     DAEMON = daemon.DashDaemon
     DESERIALIZER = lib_tx_dash.DeserializerDash
 
     # RTM asset opcodes appended after standard P2PKH scripts
     OP_CHECKSIG = 0xac
     OP_ASSET_ID = 0xbc
+    OP_PUSHDATA1 = 0x4c
 
     @classmethod
     def hashX_from_script(cls, script):
@@ -1400,7 +1402,7 @@ class Raptoreum(Coin):
         Asset transfer scripts are standard P2PKH with asset data appended
         after OP_CHECKSIG:
 
-            <P2PKH script> OP_CHECKSIG OP_ASSET_ID <payload> OP_DROP OP_DROP
+            <P2PKH script> OP_CHECKSIG OP_ASSET_ID <push> <payload> OP_DROP
 
         Stripping everything after OP_CHECKSIG produces the same hashX as
         a regular P2PKH output to the same address, so asset transactions
@@ -1411,6 +1413,61 @@ class Raptoreum(Coin):
         if idx != -1:
             script = script[:idx + 1]  # keep through OP_CHECKSIG
         return super().hashX_from_script(script)
+
+    @classmethod
+    def parse_asset_script(cls, script):
+        '''Parse an RTM asset payload from a pk_script.
+
+        Returns a dict with keys (asset_id, flag, unique_id, amount)
+        or None if the script has no asset payload.
+
+        Script format after standard P2PKH:
+            OP_CHECKSIG(ac) OP_ASSET_ID(bc) OP_PUSHDATA1(4c) <len>
+            <payload: "rtm@" + asset_id_hex(64) + flag(1) + unique_id(8 LE) + amount(8 LE)>
+            OP_DROP(75)
+        '''
+        import struct
+        marker = bytes([cls.OP_CHECKSIG, cls.OP_ASSET_ID])
+        pos = script.find(marker)
+        if pos == -1:
+            return None
+
+        after = script[pos + 2:]
+        if len(after) < 3:
+            return None
+
+        # Read push opcode and length
+        if after[0] == cls.OP_PUSHDATA1:
+            if len(after) < 2:
+                return None
+            payload_len = after[1]
+            payload_start = 2
+        elif after[0] <= 0x4b:
+            payload_len = after[0]
+            payload_start = 1
+        else:
+            return None
+
+        if len(after) < payload_start + payload_len:
+            return None
+
+        payload = after[payload_start:payload_start + payload_len]
+
+        # Expect "rtm@" prefix followed by 64-char hex asset id + 17 binary bytes
+        if len(payload) < 85 or payload[:4] != b'rtm@':
+            return None
+
+        asset_id = payload[4:68].decode('ascii')
+        flag = payload[68]
+        unique_id = struct.unpack('<q', payload[69:77])[0]
+        amount = struct.unpack('<q', payload[77:85])[0]
+
+        return {
+            'asset_id': asset_id,
+            'flag': flag,
+            'unique_id': unique_id,
+            'amount': amount,
+        }
 
 
 class RaptoreumTestnet(Raptoreum):

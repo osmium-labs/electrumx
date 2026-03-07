@@ -10,6 +10,7 @@
 
 
 import asyncio
+import struct
 import time
 from typing import Sequence, Tuple, List, Callable, Optional, TYPE_CHECKING, Type
 
@@ -203,6 +204,12 @@ class BlockProcessor:
         self.utxo_cache = {}
         self.db_deletes = []
 
+        # Asset cache (parallel to utxo_cache for asset-bearing outputs)
+        # Maps tx_hash + idx_packed → asset_db_value (49 bytes)
+        self.asset_cache = {}
+        self.asset_db_deletes = []
+        self.asset_undo_infos = []  # type: List[Tuple[Sequence[bytes], int]]
+
         # If the lock is successfully acquired, in-memory chain state
         # is consistent with self.height
         self.state_lock = asyncio.Lock()
@@ -359,7 +366,10 @@ class BlockProcessor:
         assert self.state_lock.locked()
         return FlushData(self.height, self.tx_count, self.headers,
                          self.tx_hashes, self.undo_infos, self.utxo_cache,
-                         self.db_deletes, self.tip)
+                         self.db_deletes, self.tip,
+                         asset_adds=self.asset_cache,
+                         asset_deletes=self.asset_db_deletes,
+                         asset_undo_infos=self.asset_undo_infos)
 
     async def flush(self, flush_utxos):
         def flush():
@@ -416,9 +426,12 @@ class BlockProcessor:
             height += 1
             is_unspendable = (is_unspendable_genesis if height >= genesis_activation
                               else is_unspendable_legacy)
-            undo_info = self.advance_txs(block.transactions, is_unspendable)
+            undo_info, asset_undo = self.advance_txs(
+                block.transactions, is_unspendable)
             if height >= min_height:
                 self.undo_infos.append((undo_info, height))
+                if asset_undo:
+                    self.asset_undo_infos.append((asset_undo, height))
                 self.db.write_raw_block(block.raw, height)
 
         headers = [block.header for block in blocks]
@@ -432,21 +445,29 @@ class BlockProcessor:
             self,
             txs: Sequence[Tx],
             is_unspendable: Callable[[bytes], bool],
-    ) -> Sequence[bytes]:
+    ) -> Tuple[Sequence[bytes], Sequence[bytes]]:
         self.tx_hashes.append(b''.join(tx.txid for tx in txs))
 
         # Use local vars for speed in the loops
         undo_info = []
+        asset_undo_info = []
         tx_num = self.tx_count
         script_hashX = self.coin.hashX_from_script
         put_utxo = self.utxo_cache.__setitem__
         spend_utxo = self.spend_utxo
         undo_info_append = undo_info.append
+        asset_undo_append = asset_undo_info.append
         update_touched = self.touched.update
         hashXs_by_tx = []
         append_hashXs = hashXs_by_tx.append
         to_le_uint32 = pack_le_uint32
         to_le_uint64 = pack_le_uint64
+
+        # Asset handling
+        parse_asset = getattr(self.coin, 'parse_asset_script', None)
+        asset_cache = self.asset_cache
+        asset_db_deletes = self.asset_db_deletes
+        utxo_db_get = self.db.utxo_db.get if self.db.utxo_db else None
 
         for tx in txs:
             tx_hash = tx.txid
@@ -462,6 +483,29 @@ class BlockProcessor:
                 undo_info_append(cache_value)
                 append_hashX(cache_value[:HASHX_LEN])
 
+                # Spend asset entry if present
+                if parse_asset is not None:
+                    prev_key = txin.prev_hash + to_le_uint32(txin.prev_idx)
+                    asset_val = asset_cache.pop(prev_key, None)
+                    if asset_val is not None:
+                        # Asset was in memory cache (not yet flushed)
+                        hashX = cache_value[:HASHX_LEN]
+                        tx_num_packed = cache_value[HASHX_LEN:HASHX_LEN + TXNUM_LEN]
+                        idx_packed = to_le_uint32(txin.prev_idx)
+                        asset_undo_append(
+                            hashX + idx_packed + tx_num_packed + asset_val)
+                    elif utxo_db_get is not None:
+                        # Check DB for previously flushed asset entry
+                        hashX = cache_value[:HASHX_LEN]
+                        tx_num_packed = cache_value[HASHX_LEN:HASHX_LEN + TXNUM_LEN]
+                        idx_packed = to_le_uint32(txin.prev_idx)
+                        adb_key = b'a' + hashX + idx_packed + tx_num_packed
+                        adb_val = utxo_db_get(adb_key)
+                        if adb_val:
+                            asset_db_deletes.append(adb_key)
+                            asset_undo_append(
+                                hashX + idx_packed + tx_num_packed + adb_val)
+
             # Add the new UTXOs
             for idx, txout in enumerate(tx.outputs):
                 # Ignore unspendable outputs
@@ -474,6 +518,19 @@ class BlockProcessor:
                 put_utxo(tx_hash + to_le_uint32(idx),
                          hashX + tx_numb + to_le_uint64(txout.value))
 
+                # Index asset data if present
+                if parse_asset is not None:
+                    asset_info = parse_asset(txout.pk_script)
+                    if asset_info:
+                        asset_id_raw = bytes.fromhex(asset_info['asset_id'])
+                        asset_db_value = (
+                            asset_id_raw
+                            + struct.pack('B', asset_info['flag'])
+                            + struct.pack('<q', asset_info['unique_id'])
+                            + struct.pack('<q', asset_info['amount'])
+                        )
+                        asset_cache[tx_hash + to_le_uint32(idx)] = asset_db_value
+
             append_hashXs(hashXs)
             update_touched(hashXs)
             tx_num += 1
@@ -483,7 +540,7 @@ class BlockProcessor:
         self.tx_count = tx_num
         self.db.tx_counts.append(tx_num)
 
-        return undo_info
+        return undo_info, asset_undo_info
 
     def backup_blocks(self, raw_blocks: Sequence[bytes]):
         '''Backup the raw blocks and flush.
@@ -527,11 +584,26 @@ class BlockProcessor:
                              f'{self.height:,d}')
         n = len(undo_info)
 
+        # Load asset undo info for this height
+        asset_undo_raw = self.db.read_asset_undo_info(self.height)
+        asset_undo_map = {}
+        if asset_undo_raw:
+            # Each entry: hashX(11) + txout_idx(4) + tx_num(5) + asset_value(49)
+            entry_len = HASHX_LEN + 4 + TXNUM_LEN + 49
+            for i in range(0, len(asset_undo_raw), entry_len):
+                entry = asset_undo_raw[i:i + entry_len]
+                lookup_key = entry[:HASHX_LEN + 4 + TXNUM_LEN]
+                asset_value = entry[HASHX_LEN + 4 + TXNUM_LEN:]
+                asset_undo_map[lookup_key] = asset_value
+
         # Use local vars for speed in the loops
         put_utxo = self.utxo_cache.__setitem__
         spend_utxo = self.spend_utxo
         touched = self.touched
         undo_entry_len = HASHX_LEN + TXNUM_LEN + 8
+        asset_cache = self.asset_cache
+        asset_db_deletes = self.asset_db_deletes
+        utxo_db_get = self.db.utxo_db.get if self.db.utxo_db else None
 
         for tx in reversed(txs):
             tx_hash = tx.txid
@@ -546,6 +618,16 @@ class BlockProcessor:
                 hashX = cache_value[:HASHX_LEN]
                 touched.add(hashX)
 
+                # Remove any asset entry for this output
+                asset_key = tx_hash + pack_le_uint32(idx)
+                asset_val = asset_cache.pop(asset_key, None)
+                if asset_val is None and utxo_db_get is not None:
+                    tx_num_packed = cache_value[HASHX_LEN:HASHX_LEN + TXNUM_LEN]
+                    adb_key = (b'a' + hashX + pack_le_uint32(idx)
+                               + tx_num_packed)
+                    if utxo_db_get(adb_key):
+                        asset_db_deletes.append(adb_key)
+
             # Restore the inputs
             for txin in reversed(tx.inputs):
                 if txin.is_generation():
@@ -555,6 +637,14 @@ class BlockProcessor:
                 put_utxo(txin.prev_hash + pack_le_uint32(txin.prev_idx), undo_item)
                 hashX = undo_item[:HASHX_LEN]
                 touched.add(hashX)
+
+                # Restore asset entry if present in undo
+                tx_num_packed = undo_item[HASHX_LEN:HASHX_LEN + TXNUM_LEN]
+                idx_packed = pack_le_uint32(txin.prev_idx)
+                asset_lookup = hashX + idx_packed + tx_num_packed
+                asset_val = asset_undo_map.pop(asset_lookup, None)
+                if asset_val is not None:
+                    asset_cache[txin.prev_hash + idx_packed] = asset_val
 
         assert n == 0
         self.tx_count -= len(txs)

@@ -44,6 +44,19 @@ class UTXO:
     value: int       # in satoshis
 
 
+@dataclass(slots=True)
+class AssetUTXO:
+    '''An unspent asset output.'''
+    tx_num: int
+    tx_pos: int
+    tx_hash: bytes
+    height: int
+    asset_id: str       # 64-char hex asset id
+    flag: int
+    unique_id: int
+    amount: int         # asset amount (not satoshis)
+
+
 @attr.s(slots=True)
 class FlushData:
     height = attr.ib()
@@ -55,6 +68,12 @@ class FlushData:
     adds = attr.ib()  # type: Dict[bytes, bytes]  # txid+out_idx -> hashX+tx_num+value_sats
     deletes = attr.ib()  # type: List[bytes]  # b'h' db keys, and b'u' db keys
     tip = attr.ib()
+    # Asset-indexed UTXOs (RTM only)
+    # Key in cache: tx_hash+out_idx (same as adds)
+    # Value: asset_id_raw(32) + flag(1) + unique_id(8 LE) + amount(8 LE)
+    asset_adds = attr.ib(factory=dict)    # type: Dict[bytes, bytes]
+    asset_deletes = attr.ib(factory=list)  # type: List[bytes]
+    asset_undo_infos = attr.ib(factory=list)  # type: List[Tuple[Sequence[bytes], int]]
 
 
 COMP_TXID_LEN = 4
@@ -223,6 +242,9 @@ class DB:
         assert not flush_data.adds
         assert not flush_data.deletes
         assert not flush_data.undo_infos
+        assert not flush_data.asset_adds
+        assert not flush_data.asset_deletes
+        assert not flush_data.asset_undo_infos
         self.history.assert_flushed()
 
     def flush_dbs(self, flush_data, flush_utxos, estimate_txs_remaining):
@@ -326,7 +348,7 @@ class DB:
             batch_delete(key)
         flush_data.deletes.clear()
 
-        # New UTXOs
+        # New UTXOs (and asset entries for those that have them)
         batch_put = batch.put
         for key, value in flush_data.adds.items():
             # key: txid+out_idx, value: hashX+tx_num+value_sats
@@ -337,11 +359,25 @@ class DB:
             suffix = txout_idx + tx_num
             batch_put(b'h' + key[:COMP_TXID_LEN] + suffix, hashX)
             batch_put(b'u' + hashX + suffix, value_sats)
+            # Asset entry if present (same key space)
+            asset_val = flush_data.asset_adds.pop(key, None)
+            if asset_val is not None:
+                batch_put(b'a' + hashX + suffix, asset_val)
         flush_data.adds.clear()
+        flush_data.asset_adds.clear()
+
+        # Asset UTXO spends (for entries that were previously flushed to DB)
+        for key in sorted(flush_data.asset_deletes):
+            batch_delete(key)
+        flush_data.asset_deletes.clear()
 
         # New undo information
         self.flush_undo_infos(batch_put, flush_data.undo_infos)
         flush_data.undo_infos.clear()
+
+        # Asset undo information
+        self.flush_asset_undo_infos(batch_put, flush_data.asset_undo_infos)
+        flush_data.asset_undo_infos.clear()
 
         if self.utxo_db.for_sync:
             block_count = flush_data.height - self.db_height
@@ -532,6 +568,24 @@ class DB:
         for undo_info, height in undo_infos:
             batch_put(self.undo_key(height), b''.join(undo_info))
 
+    # -- Asset undo information
+
+    def asset_undo_key(self, height: int) -> bytes:
+        '''DB key for asset undo information at the given height.'''
+        return b'V' + pack_be_uint32(height)
+
+    def read_asset_undo_info(self, height):
+        '''Read asset undo information for the given height.'''
+        return self.utxo_db.get(self.asset_undo_key(height))
+
+    def flush_asset_undo_infos(
+            self, batch_put,
+            asset_undo_infos: Sequence[Tuple[Sequence[bytes], int]]
+    ):
+        '''asset_undo_infos is a list of (undo_entries, height) pairs.'''
+        for undo_entries, height in asset_undo_infos:
+            batch_put(self.asset_undo_key(height), b''.join(undo_entries))
+
     def raw_block_prefix(self):
         return 'meta/block'
 
@@ -557,14 +611,14 @@ class DB:
 
     def clear_excess_undo_info(self):
         '''Clear excess undo info.  Only most recent N are kept.'''
-        prefix = b'U'
         min_height = self.min_undo_height(self.db_height)
         keys = []
-        for key, _hist in self.utxo_db.iterator(prefix=prefix):
-            height, = unpack_be_uint32(key[-4:])
-            if height >= min_height:
-                break
-            keys.append(key)
+        for prefix in (b'U', b'V'):
+            for key, _hist in self.utxo_db.iterator(prefix=prefix):
+                height, = unpack_be_uint32(key[-4:])
+                if height >= min_height:
+                    break
+                keys.append(key)
 
         if keys:
             with self.utxo_db.write_batch() as batch:
@@ -769,6 +823,41 @@ class DB:
                 return utxos
             self.logger.warning(f'all_utxos: tx hash not '
                                 f'found (reorg?), retrying...')
+            await sleep(0.25)
+
+    async def all_asset_utxos(self, hashX):
+        '''Return all asset UTXOs for an address.
+
+        Key: b'a' + hashX + txout_idx(4) + tx_num(TXNUM_LEN)
+        Value: asset_id_raw(32) + flag(1) + unique_id(8 LE) + amount(8 LE)
+        '''
+        import struct
+
+        def read_asset_utxos():
+            utxos = []
+            txnum_padding = bytes(8 - TXNUM_LEN)
+            prefix = b'a' + hashX
+            for db_key, db_value in self.utxo_db.iterator(prefix=prefix):
+                txout_idx, = unpack_le_uint32(db_key[-TXNUM_LEN-4:-TXNUM_LEN])
+                tx_num, = unpack_le_uint64(db_key[-TXNUM_LEN:] + txnum_padding)
+                # Value: asset_id_raw(32) + flag(1) + unique_id(8) + amount(8)
+                asset_id_raw = db_value[:32]
+                flag = db_value[32]
+                unique_id = struct.unpack('<q', db_value[33:41])[0]
+                amount = struct.unpack('<q', db_value[41:49])[0]
+                tx_hash, height = self.fs_tx_hash(tx_num)
+                utxos.append(AssetUTXO(
+                    tx_num, txout_idx, tx_hash, height,
+                    asset_id_raw.hex(), flag, unique_id, amount,
+                ))
+            return utxos
+
+        while True:
+            utxos = await run_in_thread(read_asset_utxos)
+            if all(u.tx_hash is not None for u in utxos):
+                return utxos
+            self.logger.warning('all_asset_utxos: tx hash not '
+                                'found (reorg?), retrying...')
             await sleep(0.25)
 
     async def lookup_utxos(self, prevouts):
