@@ -1963,6 +1963,91 @@ class RaptoreumElectrumX(DashElectrumX):
                 self.scripthash_listassets,
         })
 
+    async def transaction_get(self, tx_hash, verbose=False):
+        '''Return the serialized raw transaction given its hash.
+
+        Overrides the base method to fix vin value enrichment for
+        transactions spending DIP2 future outputs, where the daemon
+        incorrectly returns value=0 and valueSat=0.
+        '''
+        result = await super().transaction_get(tx_hash, verbose)
+        if not verbose or not isinstance(result, dict):
+            return result
+        return await self._fix_vin_values(result)
+
+    async def _fix_vin_values(self, result):
+        '''Enrich vin entries with value/valueSat/address from the
+        previous outputs.  The Raptoreum daemon does not include these
+        fields in getrawtransaction verbose output, so we fetch the
+        parent transactions ourselves and fill them in.'''
+        vin = result.get('vin', [])
+        if not vin:
+            return result
+
+        # Collect non-coinbase vin entries that need enrichment
+        need = {}  # prev_txid -> [(vin_idx, vout_idx), ...]
+        for i, entry in enumerate(vin):
+            if 'coinbase' in entry:
+                continue
+            if 'valueSat' not in entry:
+                prev_txid = entry.get('txid')
+                if prev_txid:
+                    need.setdefault(prev_txid, []).append(
+                        (i, entry.get('vout', 0)))
+
+        if not need:
+            return result
+
+        # Batch-fetch raw parent transactions
+        raw_txs = await self.daemon_request(
+            'getrawtransactions', list(need.keys()))
+
+        coin = self.coin
+        for prev_txid, raw_tx in zip(need.keys(), raw_txs):
+            if raw_tx is None:
+                continue
+            tx = coin.DESERIALIZER(raw_tx, 0).read_tx()
+            for vin_idx, vout_idx in need[prev_txid]:
+                if vout_idx < len(tx.outputs):
+                    txout = tx.outputs[vout_idx]
+                    vin[vin_idx]['valueSat'] = txout.value
+                    vin[vin_idx]['value'] = (
+                        txout.value / coin.VALUE_PER_COIN)
+                    if not vin[vin_idx].get('address'):
+                        addr = self._address_from_pk_script(
+                            txout.pk_script)
+                        if addr:
+                            vin[vin_idx]['address'] = addr
+
+        return result
+
+    def _address_from_pk_script(self, pk_script):
+        '''Extract a P2PKH or P2SH address from a pk_script, stripping
+        any asset payload first.'''
+        coin = self.coin
+        # Strip RTM asset payload if present
+        marker = bytes([0xac, 0xbc])  # OP_CHECKSIG OP_ASSET_ID
+        idx = pk_script.find(marker)
+        if idx != -1:
+            pk_script = pk_script[:idx + 1]
+
+        # P2PKH: OP_DUP OP_HASH160 <20> <hash160> OP_EQUALVERIFY OP_CHECKSIG
+        if (len(pk_script) == 25
+                and pk_script[0] == 0x76 and pk_script[1] == 0xa9
+                and pk_script[2] == 0x14
+                and pk_script[23] == 0x88 and pk_script[24] == 0xac):
+            hash160 = pk_script[3:23]
+            return coin.ENCODE_CHECK(coin.P2PKH_VERBYTE + hash160)
+
+        # P2SH: OP_HASH160 <20> <hash160> OP_EQUAL
+        if (len(pk_script) == 23
+                and pk_script[0] == 0xa9 and pk_script[1] == 0x14
+                and pk_script[22] == 0x87):
+            hash160 = pk_script[2:22]
+            return coin.ENCODE_CHECK(coin.P2SH_VERBYTES[0] + hash160)
+
+        return None
+
     async def scripthash_listassets(self, scripthash):
         '''Return asset UTXOs for a scripthash.
 
