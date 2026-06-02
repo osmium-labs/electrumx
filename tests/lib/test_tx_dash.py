@@ -52,6 +52,35 @@ CB_TX_V3 = (
     'e4fd04c9f7b149df160800a9fdbf08311b93484e545a876e81e3408a4c8358f11ce2c9'
     'c01206c39122875f9dbfea67e8953da4e63a1cd8551dfc94196f1600000000')
 
+# Parent-chain AuxPoW coinbase from Osmium (OSMI) mainnet block 676,060.
+# A DIP4 coinbase special tx (tx_type 5) whose CbTx payload is *version 5* —
+# a layout DashCbTx does not model. The structured reader stops 276 bytes
+# short of the declared extra_payload_size, which previously tripped
+# `assert self.cursor == end` and crashed the OSMI server on this block.
+OSMI_AUXPOW_PARENT_CB_TX_V5 = (
+    '0300050001000000000000000000000000000000000000000000000000000000000000'
+    '0000ffffffff4d02c7690430c7e5690880001eae497c1e002f7a706f6f6c2e63612f1a'
+    '25a7622f004f534d4193527703c276651a160e8be488726cfc8c1a672990cd3210f93c'
+    '1c3a8a149c54040000000000000000000000053765cd1d000000001976a9140f88839f'
+    '36be818d6709fe5cd39b56c78f32948688ac67ca9a3b0000000017a9140fd2497322e9'
+    'd0a0c681fd5b4beb374d1b89392d873365cd1d000000001976a9140acbf5a34249b6ef'
+    'aed3072589c07f6c3c7e74aa88ace60b5a160000000017a914621bd4ef835272a795b4'
+    '6babe03a1f5559e0b51e874c5973070000000017a914577268b060369798d215b6f278'
+    'efb2cd72fa77348700000000fdc3010500c769000092ecca0441fa24ec28d08b758947'
+    '3d222e8fc09e4bc35e505dc63fd17ab95c120000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000000000'
+    '0000000000000000000000000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000af24855e30055569c29bde647cd6d8b9d274bcc6'
+    'ab8f445ef86ec63b56dff716ac723a732e9fe2a5d960deb68e8b582bb5269b108f16bc'
+    '85a5c60598467ca66a92f4c4897e74fc2dc35e961c43b0e38265111aeb25278e2ef982'
+    'eb0bfe7787de155cba6c138a096ec8e4f245f4e769060db4551a83e18a0efd74361388'
+    '0b67d974b810fb270dc047f73aa1447ab73dc267df548914c44563e13b3cd908e04b18'
+    '8dab98d8cf88c86fbe92298c6664c492018ac9f41679108ec2e28b472a2d59ec38fdb5'
+    '8b6f310623284fb77f52f45fe09ee9aa8080483283c9bce8d1bb051828ae010201af24'
+    '855e30055569c29bde647cd6d8b9d274bcc6ab8f445ef86ec63b56dff716ac723a732e'
+    '9fe2a5d960deb68e8b582b')
+
 
 PRO_REG_TX = (
     '030001000335f1c2ca44a1eb72e59f589df2852caacba39b7c0a5e61967f6b71d7a763'
@@ -249,6 +278,24 @@ def test_dash_tx_cb_tx_v3():
     assert extra.assetLockedAmount == 376379796
     ser = tx.serialize()
     assert ser == test
+
+
+def test_dash_tx_cb_tx_v5_unmodeled_version():
+    # Regression: OSMI block 676,060 carries a DIP4 coinbase whose CbTx
+    # payload is version 5. DashCbTx only models versions 1-3, so the
+    # structured reader under-reads the extra payload. The deserializer
+    # must fall back to consuming the declared extra_payload_size as
+    # opaque bytes instead of crashing on `assert self.cursor == end`.
+    test = bfh(OSMI_AUXPOW_PARENT_CB_TX_V5)
+    deser = lib_tx_dash.DeserializerDash(test)
+    tx = deser.read_tx()
+    assert tx.version == 3
+    assert tx.tx_type == 5
+    # Whole tx consumed — no leftover, no overrun.
+    assert deser.cursor == len(test)
+    # Unmodeled version is kept as opaque bytes of the declared size.
+    assert isinstance(tx.extra_payload, (bytes, bytearray))
+    assert len(tx.extra_payload) == 451
 
 
 def test_dash_tx_pro_reg_tx():

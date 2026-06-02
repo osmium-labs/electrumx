@@ -421,8 +421,18 @@ class DeserializerDash(Deserializer):
             spec_tx_class = DeserializerDash.SPEC_TX_HANDLERS.get(tx_type)
             if spec_tx_class:
                 read_method = getattr(spec_tx_class, 'read_tx_extra', None)
+                payload_start = self.cursor
                 extra_payload = read_method(self)
                 assert isinstance(extra_payload, spec_tx_class)
+                if self.cursor != end:
+                    # The payload is a newer version than this handler
+                    # models (e.g. Osmium DIP4 coinbase v5), so the
+                    # structured read didn't span the whole payload. Keep
+                    # it as opaque bytes of the declared size — the inner
+                    # fields aren't used for indexing, and this preserves
+                    # the correct txid and cursor position.
+                    self.cursor = payload_start
+                    extra_payload = self._read_nbytes(extra_payload_size)
             else:
                 extra_payload = self._read_nbytes(extra_payload_size)
             assert self.cursor == end
