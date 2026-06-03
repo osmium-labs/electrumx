@@ -46,6 +46,15 @@ version = { attr = 'electrumx.__version__' }
 dev = [
     "objgraph",
 ]
+# Everything needed to run the full test suite (`pip install -e .[test]`).
+# Pulls in the test runner plus the altcoin header-hash libs the block /
+# address tests need (e.g. Osmium needs dash_hash, Raptoreum's deps are core).
+# Requires the system LevelDB headers for plyvel — see tests/README.md.
+test = [
+    "e-x[blake256,groestl,dash_hash,crypto]",
+    "pytest",
+    "pytest-asyncio",
+]
 rocksdb = [
     "python-rocksdb>=0.6.9",
     "Cython<3.0",
