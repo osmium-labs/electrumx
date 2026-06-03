@@ -1,0 +1,45 @@
+# Templated ElectrumX instance unit — one per coin/instance.
+#
+# Instance name (%i) selects the per-instance environment file, so a single
+# unit serves every chain you run:
+#
+#   /etc/electrumx/rtm.conf          -> systemctl enable --now electrumx@rtm
+#   /etc/electrumx/osmi.conf         -> systemctl enable --now electrumx@osmi
+#   /etc/electrumx/rtm-testnet.conf  -> systemctl enable --now electrumx@rtm-testnet
+#
+# Each conf is an EnvironmentFile holding COIN, NET, DB_DIRECTORY, DAEMON_URL,
+# SERVICES, etc. (see contrib/systemd/electrumx.conf for the format).
+#
+# If you run from a virtualenv, override ExecStart once for all instances:
+#   systemctl edit electrumx@
+#   [Service]
+#   ExecStart=
+#   ExecStart=/path/to/venv/bin/electrumx_server
+
+[Unit]
+Description=ElectrumX %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/electrumx/%i.conf
+ExecStart=/usr/local/bin/electrumx_server
+User=electrumx
+Group=electrumx
+LimitNOFILE=8192
+
+# Restart on ANY exit, including a clean exit(0).  A history flush-count
+# overflow shuts the server down cleanly, so Restart=on-failure would miss
+# it and leave the service dead.  Combined with the startup self-heal
+# compaction, this turns that failure into a brief auto-recovering restart.
+Restart=always
+RestartSec=10
+
+# Allow a graceful flush on stop, and a startup self-heal compaction (only
+# triggered when flush_count is near the limit) to finish before systemd
+# considers startup failed.
+TimeoutStopSec=30min
+TimeoutStartSec=6h
+
+[Install]
+WantedBy=multi-user.target

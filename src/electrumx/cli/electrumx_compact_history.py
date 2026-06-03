@@ -52,15 +52,8 @@ async def compact_history():
 
     assert not db.first_sync
     history = db.history
-    # Continue where we left off, if interrupted
-    if history.comp_cursor == -1:
-        history.comp_cursor = 0
-
-    history.comp_flush_count = max(history.comp_flush_count, 1)
-    limit = 8 * 1000 * 1000
-
-    while history.comp_cursor != -1:
-        history._compact_history(limit)
+    # Compaction resumes automatically if a previous run was interrupted.
+    history.compact()
 
     # When completed also update the UTXO flush count
     db.set_flush_count(history.flush_count)
@@ -69,9 +62,8 @@ async def compact_history():
 def main():
     logging.basicConfig(level=logging.INFO)
     logging.info('Starting history compaction...')
-    loop = asyncio.get_event_loop()
     try:
-        loop.run_until_complete(compact_history())
+        asyncio.run(compact_history())
     except Exception:
         traceback.print_exc()
         logging.critical('History compaction terminated abnormally')

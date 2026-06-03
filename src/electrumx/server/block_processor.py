@@ -778,6 +778,9 @@ class BlockProcessor:
 
     async def _first_open_dbs(self):
         await self.db.open_for_sync()
+        # Self-heal: if the history flush counter is nearing its 2-byte
+        # ceiling, compact now (before processing) rather than crash on it.
+        await self.db.maybe_compact_history()
         self.height = self.db.db_height
         self.tip = self.db.db_tip
         self.tx_count = self.db.db_tx_count

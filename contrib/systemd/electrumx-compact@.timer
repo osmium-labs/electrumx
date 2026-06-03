@@ -1,0 +1,21 @@
+# Weekly history compaction for one ElectrumX instance.
+#
+#   systemctl enable --now electrumx-compact@rtm.timer
+#   systemctl enable --now electrumx-compact@osmi.timer
+#   systemctl enable --now electrumx-compact@rtm-testnet.timer
+#
+# Weekly is far more often than needed (flush_count climbs at ~1 per block),
+# so the counter never gets close to its 65535 ceiling.  This is the primary,
+# proactive protection; the server's startup self-heal is the backstop.
+
+[Unit]
+Description=Weekly history compaction for ElectrumX %i
+
+[Timer]
+OnCalendar=Sun *-*-* 04:00:00
+RandomizedDelaySec=1h
+# Run on next boot if the machine was off at the scheduled time.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

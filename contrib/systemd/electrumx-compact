@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+#
+# Compact an ElectrumX instance's history database.
+#
+#   electrumx-compact <instance>      # e.g. electrumx-compact rtm
+#
+# Stops electrumx@<instance>, compacts its history DB as the DB-owning user
+# with that instance's environment, then restarts the server if it was up.
+# Run as root (it drives systemctl); the compaction drops to ELECTRUMX_USER.
+#
+# Overridable via the environment:
+#   ELECTRUMX_USER     account that owns the DB files   (default: electrumx)
+#   ELECTRUMX_COMPACT  path to electrumx_compact_history (default: /usr/local/bin/electrumx_compact_history)
+#   ELECTRUMX_CONF_DIR directory of per-instance confs   (default: /etc/electrumx)
+
+set -euo pipefail
+
+inst="${1:?usage: electrumx-compact <instance>}"
+conf_dir="${ELECTRUMX_CONF_DIR:-/etc/electrumx}"
+conf="${conf_dir}/${inst}.conf"
+unit="electrumx@${inst}.service"
+run_user="${ELECTRUMX_USER:-electrumx}"
+compact_bin="${ELECTRUMX_COMPACT:-/usr/local/bin/electrumx_compact_history}"
+
+if [ ! -r "$conf" ]; then
+    echo "electrumx-compact: cannot read $conf" >&2
+    exit 1
+fi
+
+was_active=no
+if systemctl is-active --quiet "$unit"; then
+    was_active=yes
+    echo "electrumx-compact: stopping $unit"
+    systemctl stop "$unit"
+fi
+
+echo "electrumx-compact: compacting history for $inst"
+# Source the instance env in a clean shell as the DB-owning user, then run
+# the compaction tool.  env -i keeps root's environment out of it.
+runuser -u "$run_user" -- env -i bash -c '
+    set -a
+    . "$1"
+    set +a
+    exec "$2"
+' _ "$conf" "$compact_bin"
+
+if [ "$was_active" = yes ]; then
+    echo "electrumx-compact: starting $unit"
+    systemctl start "$unit"
+fi
+
+echo "electrumx-compact: done for $inst"

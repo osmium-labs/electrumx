@@ -1,0 +1,18 @@
+# Oneshot that compacts an instance's history DB, then restarts it.
+#
+# Driven by electrumx-compact@.timer (weekly), but you can also run it on
+# demand:  systemctl start electrumx-compact@rtm
+#
+# Compaction needs exclusive DB access, so the wrapper stops electrumx@%i,
+# runs the compaction as the DB-owning user with that instance's environment,
+# and starts the server again.  It runs as root so it can drive systemctl;
+# the compaction itself drops to the configured user.
+
+[Unit]
+Description=Compact ElectrumX %i history database
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/electrumx-compact %i
+# History compaction can take a while on a large mainnet DB.
+TimeoutStartSec=6h

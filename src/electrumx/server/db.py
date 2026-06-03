@@ -29,7 +29,7 @@ from electrumx.lib.util import (
     unpack_le_uint32, unpack_be_uint32, unpack_le_uint64
 )
 from electrumx.server.storage import db_class, Storage
-from electrumx.server.history import History, TXNUM_LEN
+from electrumx.server.history import History, TXNUM_LEN, MAX_FLUSH_COUNT
 
 if TYPE_CHECKING:
     from electrumx.server.env import Env
@@ -217,6 +217,29 @@ class DB:
             self.history.close_db()
             self.utxo_db = None
         await self._open_dbs(False, False)
+
+    async def maybe_compact_history(self):
+        '''Compact the history DB in-place if its flush_count is nearing the
+        limit History.flush() can pack into a key suffix, so a long-running
+        server self-heals on restart instead of crashing on overflow.
+
+        Must be called with the DBs open (e.g. just after open_for_sync) and
+        before block processing starts.  No-op in the common case.'''
+        if not self.history.needs_compaction:
+            return
+        self.logger.warning(
+            f'history flush count {self.history.flush_count:,d} is near the '
+            f'{MAX_FLUSH_COUNT:,d} limit; compacting history before serving')
+
+        def compact():
+            start = time.monotonic()
+            self.history.compact()
+            self.set_flush_count(self.history.flush_count)
+            self.logger.info(
+                f'history compaction complete in {time.monotonic() - start:.0f}s; '
+                f'flush count reset to {self.history.flush_count:,d}')
+
+        await run_in_thread(compact)
 
     # Header merkle cache
 

@@ -27,6 +27,16 @@ if TYPE_CHECKING:
 TXNUM_LEN = 5
 FLUSHID_LEN = 2
 
+# History.flush() packs flush_count into a FLUSHID_LEN-byte key suffix, so the
+# counter must stay below this.  Once the server is caught up it flushes once
+# per block, so flush_count climbs at block cadence; compaction merges the
+# per-flush segments and resets it (see _flush_compaction / compact).
+MAX_FLUSH_COUNT = (1 << (8 * FLUSHID_LEN)) - 1
+# Compact automatically once flush_count climbs to within this margin of the
+# ceiling.  The margin absorbs the flushes between crossing the threshold and
+# the next restart, so the server compacts on restart rather than overflowing.
+COMPACT_FLUSH_COUNT = MAX_FLUSH_COUNT - 5535
+
 
 class History:
 
@@ -70,6 +80,13 @@ class History:
         if self.db:
             self.db.close()
             self.db = None
+
+    @property
+    def needs_compaction(self):
+        '''True when flush_count is close enough to MAX_FLUSH_COUNT that the
+        FLUSHID_LEN-byte suffix in flush() risks overflowing.  Compaction
+        merges the per-flush segments and resets the counter.'''
+        return self.flush_count >= COMPACT_FLUSH_COUNT
 
     def read_state(self):
         state = self.db.get(b'state\0\0')
@@ -326,6 +343,18 @@ class History:
             write_size += self._compact_hashX(prior_hashX, hist_map, hist_list,
                                               write_items, keys_to_delete)
         return write_size
+
+    def compact(self):
+        '''Run history compaction to completion, resetting flush_count by
+        merging the per-flush history segments.  The history DB must be open
+        and not serving.  This is the loop the standalone
+        electrumx_compact_history tool and the server's self-heal both use.'''
+        if self.comp_cursor == -1:
+            self.comp_cursor = 0
+        self.comp_flush_count = max(self.comp_flush_count, 1)
+        limit = 8 * 1000 * 1000
+        while self.comp_cursor != -1:
+            self._compact_history(limit)
 
     def _compact_history(self, limit):
         '''Inner loop of history compaction.  Loops until limit bytes have

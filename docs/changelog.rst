@@ -3,6 +3,27 @@
 ===========
 
 
+Unreleased (fork)
+=================
+
+* history flush-count overflow:
+   - fix: the per-flush history counter is packed into a 2-byte key suffix and,
+     once caught up, climbs ~1 per block — reaching its 65535 ceiling in a few
+     months and crashing the server (``struct.error: 'H' format requires
+     0 <= number <= 65535``).  The server now compacts history automatically at
+     startup when the counter nears the limit (``History.needs_compaction``), so
+     a long-running instance self-heals on restart instead of crashing.
+   - new: ``contrib/systemd/`` templated units with a weekly
+     ``electrumx-compact@<inst>.timer`` (proactive compaction) and
+     ``Restart=always`` (a flush-count crash exits cleanly, which
+     ``Restart=on-failure`` would miss).  See ``contrib/systemd/README.md``.
+* tooling:
+   - fix: ``electrumx_compact_history`` failed on Python 3.14 with
+     ``RuntimeError: There is no current event loop`` — switched to
+     ``asyncio.run()``.
+   - refactor: server self-heal and the compaction tool share ``History.compact()``.
+
+
 Version 1.19.0 (11 Nov 2025)
 =============================
 
