@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 
 
 from electrumx.lib.coins import Raptoreum, RaptoreumTestnet
-from electrumx.server.session import RaptoreumElectrumX
+from electrumx.server.session import asset_metadata_fields, RaptoreumElectrumX
 from electrumx.server.db import FlushData, AssetUTXO
 from electrumx.lib.hash import HASHX_LEN
 from electrumx.server.history import TXNUM_LEN
@@ -555,3 +555,30 @@ class TestVoutAssetBaseUnits:
         out = RaptoreumElectrumX._add_vout_asset_base_units(Raptoreum, tx)
 
         assert 'amount_sat' not in out['vout'][0]['scriptPubKey']['asset']
+
+
+class TestAssetMetadataFields:
+    """The same daemon spells these two ways, and reading one caches a null."""
+
+    def test_reads_the_by_id_spelling(self):
+        # getassetdetailsbyid answers Asset_name / Decimalpoint. Reading `name` here is what made
+        # listassets return name: null for every asset on a live server.
+        assert asset_metadata_fields(
+            {'Asset_id': 'ab', 'Asset_name': 'SHABANG', 'Decimalpoint': 0}
+        ) == {'decimalPoint': 0, 'name': 'SHABANG'}
+
+    def test_reads_the_by_name_spelling(self):
+        # getassetdetailsbyname and listassets answer name / decimalPoint.
+        assert asset_metadata_fields({'name': 'TON', 'decimalPoint': 8}) == {
+            'decimalPoint': 8,
+            'name': 'TON',
+        }
+
+    def test_keeps_a_zero_decimal_point(self):
+        # Zero is what every unique asset has, and unique assets are most of the chain. Testing
+        # truthiness rather than None would discard the commonest real value.
+        assert asset_metadata_fields({'Asset_name': 'X', 'Decimalpoint': 0})['decimalPoint'] == 0
+
+    def test_reports_nothing_rather_than_guessing(self):
+        # A shape we have not seen yields None, which the caller logs. It must not invent a name.
+        assert asset_metadata_fields({'unexpected': 1}) == {'decimalPoint': None, 'name': None}

@@ -1953,6 +1953,29 @@ class DashElectrumX(ElectrumX):
         return res
 
 
+def asset_metadata_fields(detail):
+    """Name and decimal point out of an asset-details response.
+
+    THE SAME DAEMON SPELLS THESE TWO WAYS.  `getassetdetailsbyname` and `listassets`
+    answer with `name` and `decimalPoint`; `getassetdetailsbyid` answers with
+    `Asset_name` and `Decimalpoint`.  Reading only one spelling is why the first
+    version of this returned `name: null` for every asset it looked up -- it cached
+    the miss rather than the value, and nothing said so.
+
+    `decimalPoint` is checked for None rather than truthiness: zero is the value a
+    unique asset has, and the most common one on the chain.
+    """
+    name = detail.get('name')
+    if name is None:
+        name = detail.get('Asset_name')
+
+    point = detail.get('decimalPoint')
+    if point is None:
+        point = detail.get('Decimalpoint')
+
+    return {'decimalPoint': point, 'name': name}
+
+
 class RaptoreumElectrumX(DashElectrumX):
     '''A TCP server that handles incoming Electrum Raptoreum connections,
     adding asset-aware RPC methods.'''
@@ -2128,11 +2151,19 @@ class RaptoreumElectrumX(DashElectrumX):
         if missing:
             details = await self.daemon_request('asset_details_many', missing)
             for asset_id, detail in zip(missing, details):
-                if isinstance(detail, dict):
-                    cache[asset_id] = {
-                        'name': detail.get('name'),
-                        'decimalPoint': detail.get('decimalPoint'),
-                    }
+                if not isinstance(detail, dict):
+                    self.logger.warning(
+                        f'no asset details for {asset_id}')
+                    continue
+                fields = asset_metadata_fields(detail)
+                if fields['name'] is None:
+                    # Never silent: an entry cached as {name: None} is indistinguishable from an
+                    # asset the daemon does not know, and that is exactly how the first version of
+                    # this shipped -- reading `name` from an RPC that answers `Asset_name`.
+                    self.logger.warning(
+                        f'asset {asset_id} details have no recognised name field: '
+                        f'{sorted(detail)}')
+                cache[asset_id] = fields
 
         return {a: cache[a] for a in asset_ids if a in cache}
 
