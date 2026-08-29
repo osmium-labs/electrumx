@@ -10,12 +10,11 @@ Covers:
 
 
 import struct
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from electrumx.lib.coins import Raptoreum, RaptoreumTestnet
-from electrumx.server.db import FlushData, AssetUTXO, UTXO, COMP_TXID_LEN
+from electrumx.server.db import FlushData, AssetUTXO
 from electrumx.lib.hash import HASHX_LEN
 from electrumx.server.history import TXNUM_LEN
 
@@ -25,6 +24,10 @@ from electrumx.server.history import TXNUM_LEN
 # ---------------------------------------------------------------------------
 
 # TX 4e39329c... vout[0]: asset_id=3eac35a7..., uid=4, amount=1.00000000
+ASSET_ID_1 = '3eac35a7799bef7416c0a331f7c0aca72c59e6ff87632467e3dd874183baf05d'
+ASSET_ID_2 = 'd47c090be1825951641222d4a22061ae047d15260147e9967322732c25d108a4'
+ASSET_ID_3 = 'b99da0820f6df05eebd9eb20e15d36cc2d4fd43fbaf8dec56351ac6e8b957b52'
+
 ASSET_SCRIPT_1 = bytes.fromhex(
     '76a914e6fddca3370f7758b21ea10e3a08f620a3168c3c88ac'  # P2PKH (25 bytes)
     'bc'                                                    # OP_ASSET_ID
@@ -78,7 +81,7 @@ class TestParseAssetScript:
     def test_basic_asset_parse(self):
         result = Raptoreum.parse_asset_script(ASSET_SCRIPT_1)
         assert result is not None
-        assert result['asset_id'] == '3eac35a7799bef7416c0a331f7c0aca72c59e6ff87632467e3dd874183baf05d'
+        assert result['asset_id'] == ASSET_ID_1
         assert result['flag'] == 1
         assert result['unique_id'] == 4
         assert result['amount'] == 100_000_000
@@ -86,7 +89,7 @@ class TestParseAssetScript:
     def test_second_asset(self):
         result = Raptoreum.parse_asset_script(ASSET_SCRIPT_2)
         assert result is not None
-        assert result['asset_id'] == 'd47c090be1825951641222d4a22061ae047d15260147e9967322732c25d108a4'
+        assert result['asset_id'] == ASSET_ID_2
         assert result['flag'] == 1
         assert result['unique_id'] == 1
         assert result['amount'] == 100_000_000
@@ -94,7 +97,7 @@ class TestParseAssetScript:
     def test_large_amount_asset(self):
         result = Raptoreum.parse_asset_script(ASSET_SCRIPT_3)
         assert result is not None
-        assert result['asset_id'] == 'b99da0820f6df05eebd9eb20e15d36cc2d4fd43fbaf8dec56351ac6e8b957b52'
+        assert result['asset_id'] == ASSET_ID_3
         assert result['flag'] == 1
         assert result['unique_id'] == 70
         assert result['amount'] == 99_993_000_000_000
@@ -348,7 +351,7 @@ class TestAdvanceTxsAssets:
     def test_asset_output_populates_cache(self):
         """When advance_txs processes an asset output, the asset_cache
         should be populated."""
-        from electrumx.lib.util import pack_le_uint32, pack_le_uint64
+        from electrumx.lib.util import pack_le_uint32
 
         # We can't easily instantiate BlockProcessor, so test the logic
         # by simulating what advance_txs does for asset outputs
@@ -378,11 +381,8 @@ class TestAdvanceTxsAssets:
 
     def test_non_asset_output_skips_cache(self):
         """Plain P2PKH outputs should not create asset_cache entries."""
-        from electrumx.lib.util import pack_le_uint32
 
         asset_cache = {}
-        tx_hash = b'\x02' * 32
-        idx = 0
 
         asset_info = Raptoreum.parse_asset_script(PLAIN_P2PKH)
         assert asset_info is None
@@ -434,3 +434,83 @@ class TestAssetDBKeyFormat:
         assert key[0:1] == b'V'
         recovered, = unpack_be_uint32(key[1:])
         assert recovered == height
+
+
+# ---------------------------------------------------------------------------
+# Real mainnet outputs.
+#
+# Every script above this line is hand-built, and every one of them carries an
+# 85-byte payload -- so the suite agreed with the parser that a payload is 85
+# bytes, and neither noticed that a DIVISIBLE asset carries 77.  These four are
+# pulled off Raptoreum mainnet: two from a STUPIDIUM transfer (divisible, no
+# unique_id) and two from a SHABANG transfer (unique).
+# ---------------------------------------------------------------------------
+
+# STUPIDIUM, divisible: 20998.60153 displayed by the daemon.
+REAL_FUNGIBLE_LARGE = bytes.fromhex(
+    '76a914c1365c9d0d448141c92ed3fd2653972685f1855488acbc4c4d72746d4034646338'
+    '6630653530316437666539393464393861313964356566333939656633623234343132'
+    '3565613761336264386433333363393630366164356561383100a8226be9e801000075'
+)
+# STUPIDIUM, divisible: 0.001 displayed.
+REAL_FUNGIBLE_SMALL = bytes.fromhex(
+    '76a914d6e533e04464c5af3ef4f761ed03e1562cf92ca888acbc4c4d72746d4034646338'
+    '6630653530316437666539393464393861313964356566333939656633623234343132'
+    '3565613761336264386433333363393630366164356561383100a08601000000000075'
+)
+# SHABANG, unique: 418 displayed, ids 2..419.
+REAL_UNIQUE = bytes.fromhex(
+    '76a914d636ae0706428b25c9ca55b98f8576610029825188acbc4c5572746d4033303639'
+    '6466313437353132323263376239343362623935623837316638666236316666346432'
+    '3230306232313037353465653161313630643530336531336101020000000000000000'
+    '6279bb0900000075'
+)
+
+
+class TestRealMainnetAssetScripts:
+    """Divisible assets were invisible: their payload is 77 bytes, not 85."""
+
+    def test_parses_a_divisible_asset_at_all(self):
+        # THE BUG. This returned None, so block_processor never wrote the
+        # output to the asset index and listassets never reported the holding.
+        assert Raptoreum.parse_asset_script(REAL_FUNGIBLE_SMALL) is not None
+
+    def test_divisible_amount_is_base_units_at_ten_to_the_eight(self):
+        # The daemon prints 0.001; the script carries 100000.  Reporting the
+        # daemon's display value as base units is eight orders of magnitude out.
+        result = Raptoreum.parse_asset_script(REAL_FUNGIBLE_SMALL)
+        assert result['amount'] == 100_000
+
+    def test_divisible_large_amount(self):
+        # 20998.60153 displayed.  Exact, and larger than a float would hold
+        # losslessly once scaled.
+        result = Raptoreum.parse_asset_script(REAL_FUNGIBLE_LARGE)
+        assert result['amount'] == 2_099_860_153_000
+
+    def test_divisible_has_no_unique_id(self):
+        # A divisible asset has nothing to number.  Zero here is the absence of
+        # the field, not a unit numbered zero -- a unique asset really can have
+        # unique_id 0, which is why the flag distinguishes them.
+        result = Raptoreum.parse_asset_script(REAL_FUNGIBLE_SMALL)
+        assert result['unique_id'] == 0
+        assert result['flag'] == 0
+
+    def test_both_divisible_outputs_name_the_same_asset(self):
+        large = Raptoreum.parse_asset_script(REAL_FUNGIBLE_LARGE)
+        small = Raptoreum.parse_asset_script(REAL_FUNGIBLE_SMALL)
+        assert large['asset_id'] == small['asset_id']
+
+    def test_unique_asset_still_parses(self):
+        # The 85-byte layout must keep working: 418 displayed, ids 2..419.
+        result = Raptoreum.parse_asset_script(REAL_UNIQUE)
+        assert result['amount'] == 41_800_000_000
+        assert result['unique_id'] == 2
+        assert result['flag'] == 1
+
+    def test_a_divisible_output_hashes_to_its_plain_address(self):
+        # It has to land in the address's ordinary history as well, or the
+        # holding is indexed and still never seen.
+        stripped = Raptoreum.hashX_from_script(REAL_FUNGIBLE_SMALL)
+        plain = Raptoreum.hashX_from_script(
+            bytes.fromhex('76a914d6e533e04464c5af3ef4f761ed03e1562cf92ca888ac'))
+        assert stripped == plain

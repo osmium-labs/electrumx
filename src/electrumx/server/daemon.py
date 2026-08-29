@@ -383,6 +383,22 @@ class DashDaemon(Daemon):
         return await self._send_single('protx', params)
 
 
+class RaptoreumDaemon(DashDaemon):
+
+    async def asset_details_many(self, asset_ids):
+        """Resolve asset ids to their metadata, one round trip for the lot.
+
+        An asset's id, name and decimalPoint are fixed at issuance, so the
+        caller can cache the answer forever.  Errors come back as None rather
+        than raising: one asset the daemon cannot describe must not cost the
+        whole balance."""
+        return await self._send_vector(
+            'getassetdetailsbyid',
+            ((asset_id,) for asset_id in asset_ids),
+            replace_errs=True)
+
+
+
 class FakeEstimateFeeDaemon(Daemon):
     '''Daemon that simulates estimatefee and relayfee RPC calls. Coin that
     wants to use this daemon must define ESTIMATE_FEE & RELAY_FEE'''

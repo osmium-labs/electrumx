@@ -35,7 +35,7 @@ from dataclasses import dataclass
 from decimal import Decimal
 from functools import partial
 from hashlib import sha256
-from typing import Sequence, Tuple, Optional
+from typing import Sequence, Optional
 
 import electrumx.lib.util as util
 from electrumx.lib.hash import Base58, double_sha256, hash_to_hex_str
@@ -1387,7 +1387,7 @@ class Raptoreum(Coin):
     REORG_LIMIT = 1000
     PEERS = []
     SESSIONCLS = RaptoreumElectrumX
-    DAEMON = daemon.DashDaemon
+    DAEMON = daemon.RaptoreumDaemon
     DESERIALIZER = lib_tx_dash.DeserializerDash
 
     # RTM asset opcodes appended after standard P2PKH scripts
@@ -1423,8 +1423,24 @@ class Raptoreum(Coin):
 
         Script format after standard P2PKH:
             OP_CHECKSIG(ac) OP_ASSET_ID(bc) OP_PUSHDATA1(4c) <len>
-            <payload: "rtm@" + asset_id_hex(64) + flag(1) + unique_id(8 LE) + amount(8 LE)>
-            OP_DROP(75)
+            <payload> OP_DROP(75)
+
+        The payload comes in TWO layouts, and reading only the longer one is
+        why divisible assets were invisible to this server:
+
+            unique   (85 bytes)  "rtm@" + id(64) + flag(1) + unique_id(8 LE) + amount(8 LE)
+            fungible (77 bytes)  "rtm@" + id(64) + flag(1) + amount(8 LE)
+
+        A unique asset numbers each indivisible unit, so it carries a
+        unique_id; a divisible one has nothing to number and omits the field
+        entirely.  Requiring 85 bytes rejected every divisible asset output,
+        so none was ever written to the asset index and none appeared in
+        blockchain.scripthash.listassets -- roughly one asset in seven on
+        mainnet.
+
+        amount is in BASE UNITS at the fixed 10^8 scale, not the display
+        value the daemon prints in getrawtransaction verbose (which is this
+        number divided by COIN).
         '''
         import struct
         marker = bytes([cls.OP_CHECKSIG, cls.OP_ASSET_ID])
@@ -1453,14 +1469,17 @@ class Raptoreum(Coin):
 
         payload = after[payload_start:payload_start + payload_len]
 
-        # Expect "rtm@" prefix followed by 64-char hex asset id + 17 binary bytes
-        if len(payload) < 85 or payload[:4] != b'rtm@':
+        if len(payload) < 77 or payload[:4] != b'rtm@':
             return None
 
         asset_id = payload[4:68].decode('ascii')
         flag = payload[68]
-        unique_id = struct.unpack('<q', payload[69:77])[0]
-        amount = struct.unpack('<q', payload[77:85])[0]
+        if len(payload) >= 85:
+            unique_id = struct.unpack('<q', payload[69:77])[0]
+            amount = struct.unpack('<q', payload[77:85])[0]
+        else:
+            unique_id = 0
+            amount = struct.unpack('<q', payload[69:77])[0]
 
         return {
             'asset_id': asset_id,

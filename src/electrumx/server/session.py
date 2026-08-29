@@ -18,7 +18,8 @@ import time
 from collections import defaultdict
 from functools import partial
 from ipaddress import IPv4Address, IPv6Address, IPv4Network, IPv6Network
-from typing import Iterable, Optional, TYPE_CHECKING, Sequence, Union, Any
+from typing import (Any, ClassVar, Iterable, Optional, Sequence,
+                    TYPE_CHECKING, Union)
 
 import attr
 from aiorpcx import (Event, JSONRPCAutoDetect, JSONRPCConnection,
@@ -31,7 +32,7 @@ import electrumx.lib.util as util
 from electrumx.lib.lrucache import LRUCache
 from electrumx.lib.util import OldTaskGroup, is_hex_str
 from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
-                                hex_str_to_hash, sha256, double_sha256)
+                                hex_str_to_hash, sha256)
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
 from electrumx.server.daemon import DaemonError
@@ -295,7 +296,7 @@ class SessionManager:
         '''Clear certain caches on chain reorgs.'''
         while True:
             await self.bp.backed_up_event.wait()
-            self.logger.info(f'reorg signalled; clearing tx_hashes and merkle caches')
+            self.logger.info('reorg signalled; clearing tx_hashes and merkle caches')
             self._reorg_count += 1
             # not: history_cache is cleared in _notify_sessions
             self._txids_cache.clear()
@@ -699,7 +700,7 @@ class SessionManager:
                 for session in list(self.sessions):
                     await group.spawn(session.close(force_after=1))
             # Finally, wait for servers to be cleaned up and remove servers
-            self.logger.info(f"waiting for all server's resources to close")
+            self.logger.info("waiting for all server's resources to close")
             for server in self.servers.values():
                 await server.wait_closed()
             servers_to_remove = list(self.servers.keys())
@@ -831,7 +832,7 @@ class SessionManager:
             result = await self.db.limited_history(hashX, limit=limit)
             cost += 0.1 + len(result) * 0.001
             if len(result) >= limit:
-                result = RPCError(BAD_REQUEST, f'history too large', cost=cost)
+                result = RPCError(BAD_REQUEST, 'history too large', cost=cost)
             self._history_cache[hashX] = result
 
         if isinstance(result, Exception):
@@ -850,7 +851,7 @@ class SessionManager:
 
         for session in self.sessions:
             if self._task_group.joined:  # this can happen during shutdown
-                self.logger.warning(f"task group already terminated. not notifying sessions.")
+                self.logger.warning("task group already terminated. not notifying sessions.")
                 return
             await self._task_group.spawn(session.notify, touched, height_changed)
 
@@ -914,7 +915,7 @@ class RPCSessionWithTaskGroup(RPCSession):
         try:
             async with self.taskgroup as group:
                 await group.spawn(asyncio.Event().wait)  # run forever (until cancel)
-        except Exception as e:
+        except Exception:
             self.logger.exception("taskgroup died.")
         finally:
             try:
@@ -1034,7 +1035,7 @@ class SessionBase(RPCSessionWithTaskGroup):
             self.logger.info(f'closing session: server.version must be first msg. got: {method}')
             await self._do_crash_old_electrum_client()
             raise ReplyAndDisconnect(RPCError(
-                BAD_REQUEST, f'use server.version to identify client'))
+                BAD_REQUEST, 'use server.version to identify client'))
         # Wait for version negotiation to finish before processing other messages.
         if method != 'server.version' and not self.sv_negotiated.is_set():
             await self.sv_negotiated.wait()
@@ -1545,7 +1546,7 @@ class ElectrumX(SessionBase):
         '''
         self.bump_cost(0.5)
         if self.sv_seen:
-            raise RPCError(BAD_REQUEST, f'server.version already sent')
+            raise RPCError(BAD_REQUEST, 'server.version already sent')
         self.sv_seen = True
 
         if client_name:
@@ -1976,10 +1977,23 @@ class RaptoreumElectrumX(DashElectrumX):
         return await self._fix_vin_values(result)
 
     async def _fix_vin_values(self, result):
-        '''Enrich vin entries with value/valueSat/address from the
-        previous outputs.  The Raptoreum daemon does not include these
-        fields in getrawtransaction verbose output, so we fetch the
-        parent transactions ourselves and fill them in.'''
+        '''Enrich vin entries from the previous outputs they spend.
+
+        Fills in value/valueSat/address, and -- the reason this matters to a
+        wallet -- the ASSET the spent output carried.  A Raptoreum input says
+        nothing about what it spent: an asset input arrives as value 0 with no
+        asset field, so netting an asset transfer from the outputs alone
+        reports the sender as receiving their own change, or as doing nothing
+        at all.  The parent transaction is the only place that answer exists,
+        and this method is already fetching and deserialising it.
+
+        A ZERO valueSat is enriched, not just a missing one.  The previous
+        version only acted when the field was absent, which meant the futures
+        case its own docstring described -- the daemon returning a present
+        value=0 for an input spending a locked output -- was never reached.
+        Zero is also exactly the signature of an asset input, so the same
+        condition selects the set that needs a parent, and no other input
+        pays for a lookup.'''
         vin = result.get('vin', [])
         if not vin:
             return result
@@ -1989,7 +2003,7 @@ class RaptoreumElectrumX(DashElectrumX):
         for i, entry in enumerate(vin):
             if 'coinbase' in entry:
                 continue
-            if 'valueSat' not in entry:
+            if 'valueSat' not in entry or entry.get('valueSat') == 0:
                 prev_txid = entry.get('txid')
                 if prev_txid:
                     need.setdefault(prev_txid, []).append(
@@ -2018,6 +2032,16 @@ class RaptoreumElectrumX(DashElectrumX):
                             txout.pk_script)
                         if addr:
                             vin[vin_idx]['address'] = addr
+
+                    # The coin already parses this to strip it before
+                    # hashing; carrying it costs nothing further here and
+                    # saves the client a round trip per asset input.
+                    # `amount` is BASE UNITS at the fixed 10^8 scale -- the
+                    # display value the daemon prints on an output is this
+                    # number divided by COIN.
+                    asset = coin.parse_asset_script(txout.pk_script)
+                    if asset:
+                        vin[vin_idx]['asset'] = asset
 
         return result
 
@@ -2048,6 +2072,36 @@ class RaptoreumElectrumX(DashElectrumX):
 
         return None
 
+    # asset id -> {name, decimalPoint}.  Both are fixed at issuance, so this
+    # never needs invalidating; it is bounded by the number of assets the
+    # chain has ever registered.
+    _asset_metadata_cache: ClassVar[dict] = {}
+
+    async def _asset_metadata(self, asset_ids):
+        """Names and decimal points for a set of asset ids.
+
+        The index stores only the id, so without this every client holding an
+        asset must make its own getassetdetailsbyid call per asset, on every
+        cold start, for a mapping that cannot change.  Resolved here once and
+        shared by every session on the server.
+
+        The NAME is what a wallet keys on and what a person recognises;
+        decimalPoint is a divisibility constraint, not a scale -- amounts are
+        base units at a fixed 10^8 regardless of it.
+        """
+        cache = RaptoreumElectrumX._asset_metadata_cache
+        missing = sorted({a for a in asset_ids if a and a not in cache})
+        if missing:
+            details = await self.daemon_request('asset_details_many', missing)
+            for asset_id, detail in zip(missing, details):
+                if isinstance(detail, dict):
+                    cache[asset_id] = {
+                        'name': detail.get('name'),
+                        'decimalPoint': detail.get('decimalPoint'),
+                    }
+
+        return {a: cache[a] for a in asset_ids if a in cache}
+
     async def scripthash_listassets(self, scripthash):
         '''Return asset UTXOs for a scripthash.
 
@@ -2057,10 +2111,13 @@ class RaptoreumElectrumX(DashElectrumX):
         hashX = scripthash_to_hashX(scripthash)
         asset_utxos = await self.db.all_asset_utxos(hashX)
         self.bump_cost(1.0 + len(asset_utxos) / 50)
+        names = await self._asset_metadata({u.asset_id for u in asset_utxos})
         return [{'tx_hash': hash_to_hex_str(u.tx_hash),
                  'tx_pos': u.tx_pos,
                  'height': u.height,
                  'asset_id': u.asset_id,
+                 'name': names.get(u.asset_id, {}).get('name'),
+                 'decimal_point': names.get(u.asset_id, {}).get('decimalPoint'),
                  'flag': u.flag,
                  'unique_id': u.unique_id,
                  'amount': u.amount}
