@@ -1974,7 +1974,41 @@ class RaptoreumElectrumX(DashElectrumX):
         result = await super().transaction_get(tx_hash, verbose)
         if not verbose or not isinstance(result, dict):
             return result
-        return await self._fix_vin_values(result)
+        result = await self._fix_vin_values(result)
+
+        return self._add_vout_asset_base_units(self.coin, result)
+
+    @staticmethod
+    def _add_vout_asset_base_units(coin, result):
+        '''Give an output's asset the same units as an input's.
+
+        The daemon prints an output's asset amount as a DISPLAY value --
+        20998.60153 -- while the script carries 2099860153000, base units at a
+        fixed 10^8.  Now that _fix_vin_values puts the script's number on the
+        input, a client reading `asset.amount` on both sides of one
+        transaction would be comparing two scales under one field name, and
+        would be wrong by eight orders of magnitude in whichever direction it
+        guessed.
+
+        So the output gains `amount_sat` beside the daemon's `amount`.  Both
+        are kept: the display value is what the daemon said and removing it
+        would be rewriting the daemon's answer, and a client that wants exact
+        arithmetic now has an integer to do it with rather than a float it
+        must scale itself.
+
+        Local work only -- the script is already in the response.
+        '''
+        for vout in result.get('vout', []):
+            spk = vout.get('scriptPubKey') or {}
+            asset = spk.get('asset')
+            script_hex = spk.get('hex')
+            if not asset or not script_hex:
+                continue
+            parsed = coin.parse_asset_script(bytes.fromhex(script_hex))
+            if parsed:
+                asset['amount_sat'] = parsed['amount']
+
+        return result
 
     async def _fix_vin_values(self, result):
         '''Enrich vin entries from the previous outputs they spend.

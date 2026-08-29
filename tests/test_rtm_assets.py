@@ -14,6 +14,7 @@ from unittest.mock import MagicMock
 
 
 from electrumx.lib.coins import Raptoreum, RaptoreumTestnet
+from electrumx.server.session import RaptoreumElectrumX
 from electrumx.server.db import FlushData, AssetUTXO
 from electrumx.lib.hash import HASHX_LEN
 from electrumx.server.history import TXNUM_LEN
@@ -514,3 +515,43 @@ class TestRealMainnetAssetScripts:
         plain = Raptoreum.hashX_from_script(
             bytes.fromhex('76a914d6e533e04464c5af3ef4f761ed03e1562cf92ca888ac'))
         assert stripped == plain
+
+
+class TestVoutAssetBaseUnits:
+    """An output's asset must not carry a different scale from an input's."""
+
+    @staticmethod
+    def _tx(script_hex, display):
+        return {'vout': [{'n': 0,
+                          'scriptPubKey': {'hex': script_hex,
+                                           'asset': {'name': 'STUPIDIUM',
+                                                     'amount': display}}}]}
+
+    def test_adds_base_units_beside_the_display_value(self):
+        # The daemon prints 0.001; the script says 100000.  Both survive, so a
+        # client can do exact arithmetic without scaling a float itself.
+        tx = self._tx(REAL_FUNGIBLE_SMALL.hex(), 0.001)
+        out = RaptoreumElectrumX._add_vout_asset_base_units(Raptoreum, tx)
+
+        asset = out['vout'][0]['scriptPubKey']['asset']
+        assert asset['amount_sat'] == 100_000
+        assert asset['amount'] == 0.001
+
+    def test_exact_on_a_value_a_float_would_round(self):
+        tx = self._tx(REAL_FUNGIBLE_LARGE.hex(), 20998.60153)
+        out = RaptoreumElectrumX._add_vout_asset_base_units(Raptoreum, tx)
+
+        assert out['vout'][0]['scriptPubKey']['asset']['amount_sat'] == 2_099_860_153_000
+
+    def test_leaves_a_plain_output_alone(self):
+        tx = {'vout': [{'n': 0, 'scriptPubKey': {'hex': PLAIN_P2PKH.hex()}}]}
+        out = RaptoreumElectrumX._add_vout_asset_base_units(Raptoreum, tx)
+
+        assert 'asset' not in out['vout'][0]['scriptPubKey']
+
+    def test_survives_an_output_with_no_script_hex(self):
+        # A response shape we have not seen must not take the whole page down.
+        tx = {'vout': [{'n': 0, 'scriptPubKey': {'asset': {'amount': 1}}}]}
+        out = RaptoreumElectrumX._add_vout_asset_base_units(Raptoreum, tx)
+
+        assert 'amount_sat' not in out['vout'][0]['scriptPubKey']['asset']
