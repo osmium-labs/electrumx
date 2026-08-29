@@ -1426,17 +1426,24 @@ class Raptoreum(Coin):
             <payload> OP_DROP(75)
 
         The payload comes in TWO layouts, and reading only the longer one is
-        why divisible assets were invisible to this server:
+        why non-unique assets were invisible to this server:
 
-            unique   (85 bytes)  "rtm@" + id(64) + flag(1) + unique_id(8 LE) + amount(8 LE)
-            fungible (77 bytes)  "rtm@" + id(64) + flag(1) + amount(8 LE)
+            unique     (85 bytes)  "rtm@" + id(64) + flag(1) + unique_id(8 LE) + amount(8 LE)
+            non-unique (77 bytes)  "rtm@" + id(64) + flag(1) + amount(8 LE)
 
-        A unique asset numbers each indivisible unit, so it carries a
-        unique_id; a divisible one has nothing to number and omits the field
-        entirely.  Requiring 85 bytes rejected every divisible asset output,
-        so none was ever written to the asset index and none appeared in
-        blockchain.scripthash.listassets -- roughly one asset in seven on
-        mainnet.
+        A unique asset numbers each of its units individually, so it carries a
+        unique_id; a non-unique one has nothing to number and omits the field.
+        Requiring 85 bytes rejected every non-unique output, so none was ever
+        written to the asset index and none appeared in
+        blockchain.scripthash.listassets.
+
+        NOT the same distinction as divisibility, which an earlier version of
+        this comment conflated with it.  `flag` says whether units are
+        individually numbered; `decimalPoint` says how finely one unit splits.
+        MAGAFISH and SPICYPARSNIPSOUP are both flag 0 with decimalPoint 0 --
+        non-unique AND indivisible -- and both were missing from a live index
+        until this was fixed.  So the affected set is every non-unique asset,
+        which is larger than the 136-of-1000 with a decimalPoint above zero.
 
         amount is in BASE UNITS at the fixed 10^8 scale, not the display
         value the daemon prints in getrawtransaction verbose (which is this
