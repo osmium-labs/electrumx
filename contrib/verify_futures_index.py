@@ -173,16 +173,23 @@ async def main():
         print(f'records span heights {heights[0]:,d} .. {heights[-1]:,d} '
               f'(median {median:,d})')
         if scan and scan_from is None:
-            scan_from = heights[-1]
-            print(f'aiming the reverse scan at {scan_from:,d} rather than the tip, '
-                  f'because that is where the futures are')
+            # Centre the window on the MEDIAN, not the newest record. Aiming at
+            # the newest one hit the sparse tail: 100,000 blocks back from the
+            # highest record found exactly one type-7, because half the records
+            # sit below the median by definition and the tail is thin.
+            scan_from = min(median + scan // 2, heights[-1])
+            print(f'aiming the reverse scan at {scan_from:,d}, centred on the median, '
+                  f'because that is where the density is')
 
     # ---- reverse -------------------------------------------------------
-    seen = missing = 0
+    seen = missing = in_window = 0
     if scan:
         start = scan_from if scan_from is not None else rpc('getblockcount', [])
-        print(f'\nreverse: scanning {scan:,d} blocks back from {start:,d} '
-              f'for type-7 transactions with no record', flush=True)
+        low = max(start - scan, 1)
+        in_window = sum(1 for h in heights if low <= h <= start)
+        print(f'\nreverse: scanning {start:,d} down to {low:,d}. '
+              f'{in_window:,d} of the {len(heights):,d} records held fall in that range.',
+              flush=True)
         for height in range(start, max(start - scan, 1), -1):
             for tx in rpc('getblock', [rpc('getblockhash', [height]), 2])['tx']:
                 if tx.get('type') != 7:
@@ -196,6 +203,13 @@ async def main():
         print(f'reverse: {seen:,d} type-7 transactions in range, {missing:,d} with no record')
         if seen and not missing:
             print('  every one of them is indexed')
+        # An EQUALITY, not a subset. Records in the window with no type-7 behind
+        # them is the opposite bug to a missing record -- harmless to spend but
+        # it would withhold coins that were never locked, and nothing else here
+        # would notice it.
+        if seen and in_window != seen:
+            print(f'  MISMATCH: {in_window:,d} records in this range but {seen:,d} '
+                  f'type-7 transactions -- the index and the chain disagree on the count')
         elif not seen:
             # An empty range passes whatever the index does, so it is not a
             # pass. Saying so is the difference between a check and a comfort.
@@ -206,7 +220,8 @@ async def main():
     db.utxo_db.close()
     db.history.close_db()
 
-    bad = mismatched + (missing if scan else 0)
+    count_off = scan and seen and in_window != seen
+    bad = mismatched + (missing if scan else 0) + (1 if count_off else 0)
     vacuous = scan and not seen
     if bad:
         print(f'\nRESULT: {bad} PROBLEM(S) -- do not trust `lock` yet')
