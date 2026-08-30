@@ -36,10 +36,15 @@ import urllib.request
 
 CONF_DIR = '/etc/electrumx'
 B58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
-# P2PKH and P2SH version bytes, from the Raptoreum coin classes.
+# P2PKH and P2SH version bytes, transcribed from the coin classes in
+# electrumx/lib/coins.py. Keyed by (COIN, NET), which is what the instance conf
+# states -- the first version of this assumed Raptoreum and refused every
+# Osmium address as "not a mainnet RTM address", which is a script bug wearing
+# the costume of a finding.
 VERSIONS = {
-    'mainnet': {0x3c: 'p2pkh', 0x10: 'p2sh'},
-    'testnet': {0x7b: 'p2pkh', 0x13: 'p2sh'},
+    ('Raptoreum', 'mainnet'): {0x3c: 'p2pkh', 0x10: 'p2sh'},
+    ('Raptoreum', 'testnet'): {0x7b: 'p2pkh', 0x13: 'p2sh'},
+    ('Osmium', 'mainnet'): {0x3f: 'p2pkh', 0x0f: 'p2sh'},
 }
 
 
@@ -51,7 +56,12 @@ def conf(instance):
     if not port:
         sys.exit(f'no tcp:// port in SERVICES of {CONF_DIR}/{instance}.conf')
 
-    return int(port.group(1)), values.get('NET', 'mainnet'), values.get('DAEMON_URL')
+    coin, net = values.get('COIN', 'Raptoreum'), values.get('NET', 'mainnet')
+    if (coin, net) not in VERSIONS:
+        sys.exit(f'no address version bytes recorded for {coin}/{net} -- add them to VERSIONS '
+                 f'from that coin class in electrumx/lib/coins.py')
+
+    return int(port.group(1)), (coin, net), values.get('DAEMON_URL')
 
 
 def daemon_rpc(url):
@@ -109,15 +119,16 @@ def b58check(address):
     return raw[0], raw[1:21]
 
 
-def scripthash(address, net):
+def scripthash(address, coin_net):
     version, hash160 = b58check(address)
-    kind = VERSIONS[net].get(version)
+    kind = VERSIONS[coin_net].get(version)
     if kind == 'p2pkh':
         script = b'\x76\xa9\x14' + hash160 + b'\x88\xac'
     elif kind == 'p2sh':
         script = b'\xa9\x14' + hash160 + b'\x87'
     else:
-        sys.exit(f'{address}: version byte {version:#x} is not a {net} RTM address')
+        sys.exit(f'{address}: version byte {version:#x} is not a '
+                 f'{coin_net[0]} {coin_net[1]} address')
 
     return hashlib.sha256(script).digest()[::-1].hex()
 
@@ -126,7 +137,7 @@ def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
     instance, addresses = sys.argv[1], sys.argv[2:]
-    port, net, url = conf(instance)
+    port, coin_net, url = conf(instance)
 
     if addresses and addresses[0] == '--coinbase':
         if not url:
@@ -152,7 +163,8 @@ def main():
             return json.loads(buf)
 
         version = call('server.version', ['check_spendability', '1.4'])
-        print('server:', version.get('result'), f'(instance {instance}, {net}, tcp {port})')
+        print('server:', version.get('result'),
+              f'(instance {instance}, {coin_net[0]} {coin_net[1]}, tcp {port})')
 
         probe = call('blockchain.scripthash.get_history_page', ['00' * 32, 5])
         if 'error' in probe:
@@ -161,7 +173,8 @@ def main():
             print('get_history_page: registered')
 
         for address in addresses:
-            answer = call('blockchain.scripthash.listunspent', [scripthash(address, net)])
+            answer = call('blockchain.scripthash.listunspent',
+                          [scripthash(address, coin_net)])
             if 'error' in answer:
                 print(f'\n{address}: {answer["error"]}')
                 continue
