@@ -12,7 +12,7 @@
 import asyncio
 import struct
 import time
-from typing import Sequence, Tuple, List, Callable, Optional, TYPE_CHECKING, Type
+from typing import Sequence, Tuple, Callable, TYPE_CHECKING, Type
 
 from aiorpcx import run_in_thread, CancelledError
 
@@ -77,7 +77,7 @@ class Prefetcher:
                 self.logger.info(f'cancelled; prefetcher stopping {e}')
                 raise
             except Exception:
-                self.logger.exception(f'ignoring unexpected exception')
+                self.logger.exception('ignoring unexpected exception')
 
     def get_prefetched_blocks(self) -> Sequence[bytes]:
         '''Called by block processor when it is processing queued blocks.'''
