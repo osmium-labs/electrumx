@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 '''Check the futures index against the daemon, in both directions.
 
-    contrib/verify_futures_index.py <instance> [--scan N]
+    contrib/verify_futures_index.py <instance> [--scan N] [--scan-from HEIGHT]
 
 STOP THE SERVER FIRST -- LevelDB admits one process:
 
@@ -25,6 +25,13 @@ TWO DIRECTIONS, and the second is the one that matters:
             Catches the fail-open failure -- an index that is a subset of the
             truth reads as "nothing is locked", and locked outputs get offered
             as ordinary money.
+
+SCAN WHERE THE FUTURES ARE. The reverse pass defaults to counting back from
+the tip, and on testnet that window held no type-7 transactions at all: it
+reported "0 with no record" while checking nothing. A range with nothing in it
+passes whatever the index does. This prints the height distribution of the
+records it holds so the scan can be aimed with --scan-from, and refuses to
+call an empty reverse pass a result.
 
 Read-only against both the database and the daemon.
 '''
@@ -87,8 +94,12 @@ async def main():
         sys.exit(__doc__)
     instance = sys.argv[1]
     scan = 0
+    scan_from = None
     if '--scan' in sys.argv:
         scan = int(sys.argv[sys.argv.index('--scan') + 1])
+    if '--scan-from' in sys.argv:
+        scan_from = int(sys.argv[sys.argv.index('--scan-from') + 1])
+        scan = scan or 50000
 
     values = load_conf(instance)
     try:
@@ -135,6 +146,7 @@ async def main():
 
     checked = mismatched = unreadable = 0
     by_txid = {}
+    heights = []
     for tx_num, mine in sorted(records.items()):
         tx_hash, height = db.fs_tx_hash(tx_num)
         if tx_hash is None:
@@ -142,6 +154,7 @@ async def main():
             continue
         txid = hash_to_hex_str(tx_hash)
         by_txid[txid] = mine
+        heights.append(height)
         if mine[2] == FUTURES_UNREADABLE:
             unreadable += 1
             print(f'  {txid} h={height:,d}  recorded UNREADABLE (all outputs withheld)')
@@ -154,13 +167,23 @@ async def main():
     print(f'forward: {checked:,d} checked against the daemon, {mismatched:,d} mismatched, '
           f'{unreadable:,d} recorded unreadable')
 
+    if heights:
+        heights.sort()
+        median = heights[len(heights) // 2]
+        print(f'records span heights {heights[0]:,d} .. {heights[-1]:,d} '
+              f'(median {median:,d})')
+        if scan and scan_from is None:
+            scan_from = heights[-1]
+            print(f'aiming the reverse scan at {scan_from:,d} rather than the tip, '
+                  f'because that is where the futures are')
+
     # ---- reverse -------------------------------------------------------
+    seen = missing = 0
     if scan:
-        tip = rpc('getblockcount', [])
-        missing = seen = 0
-        print(f'\nreverse: scanning {scan:,d} blocks back from {tip:,d} '
+        start = scan_from if scan_from is not None else rpc('getblockcount', [])
+        print(f'\nreverse: scanning {scan:,d} blocks back from {start:,d} '
               f'for type-7 transactions with no record', flush=True)
-        for height in range(tip, max(tip - scan, 1), -1):
+        for height in range(start, max(start - scan, 1), -1):
             for tx in rpc('getblock', [rpc('getblockhash', [height]), 2])['tx']:
                 if tx.get('type') != 7:
                     continue
@@ -173,12 +196,24 @@ async def main():
         print(f'reverse: {seen:,d} type-7 transactions in range, {missing:,d} with no record')
         if seen and not missing:
             print('  every one of them is indexed')
+        elif not seen:
+            # An empty range passes whatever the index does, so it is not a
+            # pass. Saying so is the difference between a check and a comfort.
+            print('  NOTHING TO CHECK -- no type-7 transaction in that range, so this\n'
+                  '  pass proved nothing. Re-run aimed at the records, e.g.\n'
+                  f'  --scan-from {heights[-1] if heights else "<height>"} --scan 100000')
 
     db.utxo_db.close()
     db.history.close_db()
 
     bad = mismatched + (missing if scan else 0)
-    print('\nRESULT:', 'OK' if not bad else f'{bad} PROBLEM(S) -- do not trust `lock` yet')
+    vacuous = scan and not seen
+    if bad:
+        print(f'\nRESULT: {bad} PROBLEM(S) -- do not trust `lock` yet')
+    elif vacuous:
+        print('\nRESULT: forward OK, reverse INCONCLUSIVE (empty range)')
+    else:
+        print('\nRESULT: OK')
 
     return 1 if bad else 0
 
