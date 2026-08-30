@@ -12,7 +12,7 @@
 import asyncio
 import struct
 import time
-from typing import Sequence, Tuple, List, Callable, Optional, TYPE_CHECKING, Type
+from typing import Sequence, Tuple, Callable, TYPE_CHECKING, Type
 
 from aiorpcx import run_in_thread, CancelledError
 
@@ -21,10 +21,11 @@ from electrumx.server.daemon import DaemonError, Daemon
 from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.script import is_unspendable_legacy, is_unspendable_genesis
 from electrumx.lib.util import (
-    chunks, class_logger, pack_le_uint32, pack_le_uint64, unpack_le_uint64, OldTaskGroup
+    chunks, class_logger, pack_le_int32, pack_le_uint16, pack_le_uint32,
+    pack_le_uint64, unpack_le_uint64, OldTaskGroup
 )
 from electrumx.lib.tx import Tx
-from electrumx.server.db import FlushData, COMP_TXID_LEN, DB
+from electrumx.server.db import FlushData, COMP_TXID_LEN, DB, FUTURES_UNREADABLE
 from electrumx.server.history import TXNUM_LEN
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ class Prefetcher:
                 self.logger.info(f'cancelled; prefetcher stopping {e}')
                 raise
             except Exception:
-                self.logger.exception(f'ignoring unexpected exception')
+                self.logger.exception('ignoring unexpected exception')
 
     def get_prefetched_blocks(self) -> Sequence[bytes]:
         '''Called by block processor when it is processing queued blocks.'''
@@ -163,6 +164,39 @@ class ChainError(Exception):
     '''Raised on error processing blocks.'''
 
 
+def pack_futures_lock(coin, tx):
+    '''The futures record for `tx`, or None if it is not a futures transaction.
+
+    Extracted from advance_txs so the FAIL-CLOSED branch can be tested. That
+    branch is the point of the whole record: a type-7 transaction whose payload
+    will not parse is stored as UNREADABLE rather than not stored, because not
+    storing it offers every one of its outputs as ordinary money -- and one of
+    them is locked by consensus. Inlined, a mutation that dropped it changed no
+    test, which is the same as having no guarantee.
+
+    FUTURES_UNREADABLE is not a real output index, so it cannot collide with
+    one; the reader turns it into "withhold every output of this transaction".
+
+    Returns maturity(4) + lock_time(4) + lock_output_index(2), little-endian,
+    with -1 where a condition is disabled. A coin with no futures support --
+    every coin but Raptoreum -- returns None without looking at the payload.
+    '''
+    futures_type = getattr(coin, 'FUTURES_TX_TYPE', None)
+    if futures_type is None or getattr(tx, 'tx_type', 0) != futures_type:
+        return None
+
+    lock = coin.parse_futures_payload(getattr(tx, 'extra_payload', None))
+    if lock is None:
+        return (pack_le_int32(-1) + pack_le_int32(-1)
+                + pack_le_uint16(FUTURES_UNREADABLE))
+
+    maturity, lock_time, lock_idx = lock
+
+    return (pack_le_int32(-1 if maturity is None else maturity)
+            + pack_le_int32(-1 if lock_time is None else lock_time)
+            + pack_le_uint16(lock_idx))
+
+
 class BlockProcessor:
     '''Process blocks and update the DB state to match.
 
@@ -209,6 +243,21 @@ class BlockProcessor:
         self.asset_cache = {}
         self.asset_db_deletes = []
         self.asset_undo_infos = []  # type: List[Tuple[Sequence[bytes], int]]
+
+        # Futures locks, keyed by tx_num rather than by output.
+        #
+        # A CFutureTx describes a TRANSACTION, and a transaction is immutable,
+        # so this record is never wrong once written and never needs deleting
+        # when an output is spent -- which is the whole reason it is not keyed
+        # like the asset cache.  It costs one 10-byte record per type-7
+        # transaction ever, against the spend-time lookup, undo info and
+        # reorg-replay the per-output shape would need.
+        #
+        # It IS deleted on a reorg: tx_nums are reassigned below the new tip,
+        # so a stale record would attach a lock to whatever transaction landed
+        # on that number next.
+        # Maps tx_num_packed -> maturity(4) + lock_time(4) + lock_output_index(2)
+        self.futures_cache = {}
 
         # If the lock is successfully acquired, in-memory chain state
         # is consistent with self.height
@@ -369,7 +418,8 @@ class BlockProcessor:
                          self.db_deletes, self.tip,
                          asset_adds=self.asset_cache,
                          asset_deletes=self.asset_db_deletes,
-                         asset_undo_infos=self.asset_undo_infos)
+                         asset_undo_infos=self.asset_undo_infos,
+                         futures_adds=self.futures_cache)
 
     async def flush(self, flush_utxos):
         def flush():
@@ -465,6 +515,9 @@ class BlockProcessor:
 
         # Asset handling
         parse_asset = getattr(self.coin, 'parse_asset_script', None)
+        # Futures handling
+        coin = self.coin
+        futures_cache = self.futures_cache
         asset_cache = self.asset_cache
         asset_db_deletes = self.asset_db_deletes
         utxo_db_get = self.db.utxo_db.get if self.db.utxo_db else None
@@ -531,6 +584,13 @@ class BlockProcessor:
                         )
                         asset_cache[tx_hash + to_le_uint32(idx)] = asset_db_value
 
+            # A FUTURES LOCK IS A PROPERTY OF THE TRANSACTION, so it is
+            # recorded once here rather than once per output.  Which output it
+            # locks is inside the payload.
+            packed = pack_futures_lock(coin, tx)
+            if packed is not None:
+                futures_cache[tx_numb] = packed
+
             append_hashXs(hashXs)
             update_touched(hashXs)
             tx_num += 1
@@ -568,6 +628,16 @@ class BlockProcessor:
             self.backup_txs(block.transactions, is_unspendable)
             self.height -= 1
             self.db.tx_counts.pop()
+
+        # Futures records name a tx_num, and tx_nums at or above the new tip
+        # are about to be handed to different transactions. A stale record
+        # would attach somebody's lock to an unrelated output, so they go now
+        # rather than at the flush -- self.tx_count is already rolled back by
+        # backup_txs, and a crash between here and the flush would otherwise
+        # leave them behind with nothing to notice them.
+        removed = self.db.delete_futures_from(self.tx_count)
+        if removed:
+            self.logger.info(f'dropped {removed:,d} futures record(s) above the new tip')
 
         self.logger.info(f'backed up to height {self.height:,d}')
 

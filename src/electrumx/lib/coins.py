@@ -1414,6 +1414,51 @@ class Raptoreum(Coin):
             script = script[:idx + 1]  # keep through OP_CHECKSIG
         return super().hashX_from_script(script)
 
+    # DIP2 special-transaction type carrying a CFutureTx payload.
+    FUTURES_TX_TYPE = 7
+
+    @classmethod
+    def parse_futures_payload(cls, extra_payload):
+        '''Parse a CFutureTx payload into (maturity, lock_time, lock_output_index).
+
+        A type-7 transaction locks ONE of its outputs -- lock_output_index --
+        until `maturity` confirmations or `lock_time` seconds from the first
+        confirmation, WHICHEVER ARRIVES FIRST.  Consensus enforces it:
+        validateFutureCoin rejects a premature spend with
+        bad-txns-premature-spend-of-future.  Nothing else withholds the
+        output, so it is indexed as ordinary unspent money exactly as an
+        immature coinbase is, and a wallet that spends it builds a
+        transaction the network refuses.
+
+        Serialised with Bitcoin's READWRITE macro, little-endian:
+
+            offset  size  field
+                 0     2  nVersion
+                 2     4  maturity           int32, -1 disables
+                 6     4  lockTime           int32, -1 disables
+                10     2  lockOutputIndex    uint16
+                12     2  fee
+
+        Offsets verified against a real mainnet type-7 payload.  -1 is how
+        CFutureTx says a condition does not apply, and it MUST be read signed
+        -- unsigned turns it into 4,294,967,295 blocks, a lock that never
+        expires.  Returns None for anything too short to state which output
+        it locks; the caller treats an unreadable payload on a type-7
+        transaction as a reason to withhold, which is the safe direction.
+
+        `fee` is not returned: it is the SPORK_22 surcharge the sender paid,
+        and nothing about whether the coins can be spent depends on it.
+        '''
+        if not extra_payload or len(extra_payload) < 12:
+            return None
+        maturity, = util.unpack_le_int32_from(extra_payload, 2)
+        lock_time, = util.unpack_le_int32_from(extra_payload, 6)
+        lock_output_index, = util.unpack_le_uint16_from(extra_payload, 10)
+
+        return (maturity if maturity >= 0 else None,
+                lock_time if lock_time >= 0 else None,
+                lock_output_index)
+
     @classmethod
     def parse_asset_script(cls, script):
         '''Parse an RTM asset payload from a pk_script.

@@ -36,6 +36,7 @@ from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
 from electrumx.server.daemon import DaemonError
+from electrumx.server.db import FUTURES_UNREADABLE
 from electrumx.server.transport import PaddedRSTransport
 
 if TYPE_CHECKING:
@@ -49,6 +50,12 @@ if TYPE_CHECKING:
 
 BAD_REQUEST = 1
 DAEMON_ERROR = 2
+
+# Largest page blockchain.scripthash.get_history_page will serve.  A page is
+# what a wallet renders, so this is generous rather than tuned; the ceiling
+# that matters is env.max_send, and 1000 entries is about 99 KB of them.  A
+# client wanting more than this wants get_history, which is still there.
+MAX_HISTORY_PAGE = 1000
 
 
 def scripthash_to_hashX(scripthash):
@@ -839,6 +846,20 @@ class SessionManager:
             raise result
         return result, cost
 
+    async def limited_history_page(self, hashX, *, limit, before):
+        '''Returns (history, cursor, cost) for one page, newest first.
+
+        NOT CACHED, where limited_history is.  That cache holds one entry per
+        hashX and is invalidated when a block touches it; a page cache would
+        need a key per (hashX, cursor, limit) and the same invalidation, and it
+        would be buying back a read this method has already made small.  The
+        cost it saves on the cached path is a few dozen reads from the hashes
+        file, against the entire history being walked, serialised and sent.
+        '''
+        history, cursor = await self.db.limited_history_page(
+            hashX, limit=limit, before=before)
+        return history, cursor, 0.1 + len(history) * 0.001
+
     async def _notify_sessions(self, height, touched):
         '''Notify sessions about height changes and touched addresses.'''
         height_changed = height != self.notified_height
@@ -1254,9 +1275,18 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0 + len(utxos) / 50)
         spends = await self.mempool.potential_spends(hashX)
 
+        # `is_coinbase` COSTS ONE ARRAY LOOKUP and answers a question this
+        # index could not otherwise be asked. Consensus refuses a coinbase
+        # spend under COINBASE_MATURITY confirmations, and without this flag a
+        # client has to fetch each funding transaction to find out -- one round
+        # trip per unspent output, which is why such clients end up capping
+        # how many outputs they will check.
+        is_coinbase = self.db.is_coinbase_utxo
+
         return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
                  'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
+                 'height': utxo.height, 'value': utxo.value,
+                 'is_coinbase': is_coinbase(utxo.tx_num, utxo.height)}
                 for utxo in utxos
                 if (utxo.tx_hash, utxo.tx_pos) not in spends]
 
@@ -1300,6 +1330,52 @@ class ElectrumX(SessionBase):
         '''Return the confirmed and unconfirmed history of a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
+
+    async def scripthash_get_history_page(self, scripthash, count=100, cursor=None):
+        '''One page of a scripthash's history, NEWEST FIRST.
+
+        WHY THIS EXISTS.  blockchain.scripthash.get_history has no paged form:
+        it returns the address's entire confirmed history on every call, and
+        every entry costs a read from the hashes file to produce and about 99
+        bytes to send.  A wallet showing twenty rows of a twenty-thousand
+        transaction address pays for all twenty thousand, on every poll.  Past
+        env.max_send // 99 entries it pays for nothing at all -- the entire
+        history is refused as 'history too large', so the busiest addresses are
+        the ones that do not work.
+
+        Returns {'history': [...], 'cursor': str|None}.  The list is the same
+        entry shape get_history returns, newest first.  `cursor` is opaque:
+        pass it back as `cursor` for the next page, and None means this page
+        reached the end.  It is not an offset, deliberately -- an offset slides
+        by however many transactions confirmed between two requests, so paging
+        through a busy address would show entries twice and skip others.
+
+        MEMPOOL ENTRIES APPEAR ON THE FIRST PAGE ONLY, ahead of the confirmed
+        ones, because that is where an unconfirmed transaction belongs in a
+        newest-first list.  They are not paged: the mempool has no stable
+        ordering to page over, and there are never many.
+        '''
+        hashX = scripthash_to_hashX(scripthash)
+        count = non_negative_integer(count)
+        if not 1 <= count <= MAX_HISTORY_PAGE:
+            raise RPCError(BAD_REQUEST, f'count must be between 1 and '
+                                        f'{MAX_HISTORY_PAGE:,d}')
+        before = None
+        if cursor is not None:
+            try:
+                before = non_negative_integer(cursor)
+            except (RPCError, ValueError):
+                raise RPCError(BAD_REQUEST, f'invalid cursor: {cursor}') from None
+
+        history, next_cursor, cost = await self.session_mgr.limited_history_page(
+            hashX, limit=count, before=before)
+        self.bump_cost(cost)
+        conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
+                for tx_hash, height in history]
+        unconf = [] if before is not None else await self.unconfirmed_history(hashX)
+
+        return {'history': unconf + conf,
+                'cursor': None if next_cursor is None else str(next_cursor)}
 
     async def scripthash_get_mempool(self, scripthash):
         '''Return the mempool transactions touching a scripthash.'''
@@ -1712,6 +1788,7 @@ class ElectrumX(SessionBase):
             'blockchain.headers.subscribe': self.headers_subscribe,
             'blockchain.scripthash.get_balance': self.scripthash_get_balance,
             'blockchain.scripthash.get_history': self.scripthash_get_history,
+            'blockchain.scripthash.get_history_page': self.scripthash_get_history_page,
             'blockchain.scripthash.get_mempool': self.scripthash_get_mempool,
             'blockchain.scripthash.listunspent': self.scripthash_listunspent,
             'blockchain.scripthash.subscribe': self.scripthash_subscribe,
@@ -2166,6 +2243,72 @@ class RaptoreumElectrumX(DashElectrumX):
                 cache[asset_id] = fields
 
         return {a: cache[a] for a in asset_ids if a in cache}
+
+    async def hashX_listunspent(self, hashX):
+        '''Unspent outputs, each carrying why it may NOT be ordinary money.
+
+        THE POINT: a client can decide spendability from this alone. Three
+        things make a Raptoreum output something other than spendable coin, and
+        all three were previously invisible here -- so a client had to fetch
+        the funding transaction of EVERY unspent output to find out, one round
+        trip each, and cap how many it checked, because a payout address with
+        10,480 of them is 10,000 round trips to answer one request.
+
+          - `is_coinbase`, from the base class, derived from tx_counts;
+          - `asset`, from the asset index this fork already writes, which the
+            plain UTXO index cannot express: an asset output carries zero RTM
+            and is otherwise indistinguishable from dust, and spending one as
+            a fee destroys somebody's holding;
+          - `lock`, a futures lock, which consensus enforces
+            (bad-txns-premature-spend-of-future) and which nothing else here
+            withholds.
+
+        `lock` is reported WITHOUT deciding whether it has released. That needs
+        the funding block's timestamp for the lockTime condition, and the
+        header offset it sits at is not the same across coins -- guessing it
+        would silently mis-date somebody's lock. Naming which outputs are
+        locked is enough: the client fetches funding transactions for those
+        alone, and there are almost never any.
+        '''
+        utxos = await super().hashX_listunspent(hashX)
+        if not utxos:
+            return utxos
+
+        assets = {(u.tx_hash, u.tx_pos): u for u in await self.db.all_asset_utxos(hashX)}
+        names = await self._asset_metadata({u.asset_id for u in assets.values()})
+
+        # Keyed by tx_num, so this asks about each funding transaction once
+        # however many of its outputs the address holds.
+        by_txid = {}
+        for utxo in await self.db.all_utxos(hashX):
+            by_txid[hash_to_hex_str(utxo.tx_hash)] = utxo.tx_num
+        locks = await self.db.futures_locks(set(by_txid.values()))
+
+        for entry in utxos:
+            asset = assets.get((hex_str_to_hash(entry['tx_hash']), entry['tx_pos']))
+            if asset is not None:
+                meta = names.get(asset.asset_id, {})
+                entry['asset'] = {'asset_id': asset.asset_id,
+                                  'name': meta.get('name'),
+                                  'decimal_point': meta.get('decimalPoint'),
+                                  'flag': asset.flag,
+                                  'unique_id': asset.unique_id,
+                                  'amount': asset.amount}
+
+            lock = locks.get(by_txid.get(entry['tx_hash'], -1))
+            if lock is None:
+                continue
+            maturity, lock_time, lock_idx = lock
+            # An unreadable payload locks every output of the transaction, not
+            # one: we cannot say which, and offering the rest is a guess about
+            # coins consensus may refuse to move.
+            unreadable = lock_idx == FUTURES_UNREADABLE
+            if unreadable or lock_idx == entry['tx_pos']:
+                entry['lock'] = {'maturity': maturity,
+                                 'locktime': lock_time,
+                                 'readable': not unreadable}
+
+        return utxos
 
     async def scripthash_listassets(self, scripthash):
         '''Return asset UTXOs for a scripthash.
