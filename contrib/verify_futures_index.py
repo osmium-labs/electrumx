@@ -5,11 +5,17 @@
     contrib/verify_futures_index.py <instance> --dump FILE          # server stopped, seconds
     contrib/verify_futures_index.py <instance> --check FILE [--from H] [--to H]
 
-STOP THE SERVER FIRST -- LevelDB admits one process:
+LevelDB admits one process, so the server has to be stopped. THIS SCRIPT DOES
+THAT ITSELF and restarts it afterwards, including on failure, because the
+hand-written version of that sequence put a minutes-long command between the
+stop and the start -- and the start got separated from it and never ran. The
+instance stayed down for nearly four hours, and the first thing to notice was a
+wallet failing to poll.
 
-    sudo systemctl stop electrumx@<instance>
     python3 contrib/verify_futures_index.py <instance> --scan 50000
-    sudo systemctl start electrumx@<instance>
+
+Pass --no-restart to manage the service yourself. It still warns on exit if it
+left the instance stopped.
 
 WHY NOT CHECK listunspent INSTEAD. Because there is probably nothing to see.
 Raptoreum futures are rare and the ones that exist have long since released
@@ -54,11 +60,48 @@ import base64
 import json
 import os
 import re
+import subprocess
 import sys
 import urllib.parse
 import urllib.request
 
 CONF_DIR = os.environ.get('ELECTRUMX_CONF_DIR', '/etc/electrumx')
+
+
+def service_active(unit):
+    return subprocess.run(['systemctl', 'is-active', '--quiet', unit]).returncode == 0
+
+
+class ServiceStopped:
+    '''Stop the unit for the body, and put it back however the body exits.
+
+    A context manager rather than two calls, because the failure this exists for
+    is the restart not running -- and the one shape that cannot happen is a
+    `finally` that is never reached.
+    '''
+
+    def __init__(self, unit, manage=True):
+        self.unit = unit
+        self.manage = manage
+        self.was_active = False
+
+    def __enter__(self):
+        self.was_active = service_active(self.unit)
+        if self.manage and self.was_active:
+            print(f'stopping {self.unit}', flush=True)
+            subprocess.run(['sudo', 'systemctl', 'stop', self.unit], check=True)
+
+        return self
+
+    def __exit__(self, *_exc):
+        if self.manage and self.was_active:
+            print(f'restarting {self.unit}', flush=True)
+            subprocess.run(['sudo', 'systemctl', 'start', self.unit], check=False)
+        elif not service_active(self.unit):
+            print(f'\n*** {self.unit} IS NOT RUNNING and this script did not start it. ***\n'
+                  f'*** Start it:  sudo systemctl start {self.unit}                  ***')
+
+        return False
 
 
 def arg_value(flag):
@@ -107,7 +150,7 @@ def daemon_lock(tx):
             future['lockOutputIndex'])
 
 
-async def main():
+async def _run():
     if len(sys.argv) < 2:
         sys.exit(__doc__)
     instance = sys.argv[1]
@@ -287,6 +330,22 @@ async def main():
         print('\nRESULT: OK')
 
     return 1 if bad else 0
+
+
+async def main():
+    """Manage the service around the database work, and only around that.
+
+    `--check` touches no database, so the server stays up for it -- that mode
+    exists precisely so a million-block scan does not need an outage.
+    """
+    if len(sys.argv) < 2:
+        sys.exit(__doc__)
+    if '--check' in sys.argv:
+        return await _run()
+
+    unit = f'electrumx@{sys.argv[1]}'
+    with ServiceStopped(unit, manage='--no-restart' not in sys.argv):
+        return await _run()
 
 
 if __name__ == '__main__':

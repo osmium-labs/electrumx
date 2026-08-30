@@ -140,10 +140,8 @@ cat <<NEXT
   Rollback:  $0 $instance --rollback
   Reclaim:   $0 $instance --discard-backup
 
-  Verify (the one that matters -- needs the server stopped briefly):
-    sudo systemctl stop $unit
+  Verify (the one that matters -- stops and restarts the service itself):
     python3 contrib/verify_futures_index.py $instance --scan 50000
-    sudo systemctl start $unit
 
   Note the time above -- how long this takes decides whether mainnet is a
   full resync or worth writing a targeted backfill for.
