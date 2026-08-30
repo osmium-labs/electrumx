@@ -16,7 +16,7 @@ import time
 from bisect import bisect_right
 from dataclasses import dataclass
 from glob import glob
-from typing import Dict, List, Sequence, Tuple, Optional, TYPE_CHECKING
+from typing import Sequence, Tuple, Optional, TYPE_CHECKING
 
 import attr
 from aiorpcx import run_in_thread, sleep
@@ -566,8 +566,8 @@ class DB:
             history = await run_in_thread(read_history)
             if all(hash is not None for hash, height in history):
                 return history
-            self.logger.warning(f'limited_history: tx hash '
-                                f'not found (reorg?), retrying...')
+            self.logger.warning('limited_history: tx hash '
+                                'not found (reorg?), retrying...')
             await sleep(0.25)
 
     # -- Undo information
@@ -844,8 +844,8 @@ class DB:
             utxos = await run_in_thread(read_utxos)
             if all(utxo.tx_hash is not None for utxo in utxos):
                 return utxos
-            self.logger.warning(f'all_utxos: tx hash not '
-                                f'found (reorg?), retrying...')
+            self.logger.warning('all_utxos: tx hash not '
+                                'found (reorg?), retrying...')
             await sleep(0.25)
 
     async def all_asset_utxos(self, hashX):
