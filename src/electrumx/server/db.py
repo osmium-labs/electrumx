@@ -26,7 +26,8 @@ from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
 from electrumx.lib.merkle import Merkle, MerkleCache
 from electrumx.lib.util import (
     formatted_time, pack_be_uint16, pack_be_uint32, pack_le_uint64, pack_le_uint32,
-    unpack_le_uint32, unpack_be_uint32, unpack_le_uint64
+    unpack_le_uint32, unpack_be_uint32, unpack_le_uint64,
+    unpack_le_int32_from, unpack_le_uint16_from
 )
 from electrumx.server.storage import db_class, Storage
 from electrumx.server.history import History, TXNUM_LEN, MAX_FLUSH_COUNT
@@ -73,10 +74,23 @@ class FlushData:
     # Value: asset_id_raw(32) + flag(1) + unique_id(8 LE) + amount(8 LE)
     asset_adds = attr.ib(factory=dict)    # type: Dict[bytes, bytes]
     asset_deletes = attr.ib(factory=list)  # type: List[bytes]
+    # tx_num_packed -> maturity(4) + lock_time(4) + lock_output_index(2)
+    futures_adds = attr.ib(factory=dict)   # type: Dict[bytes, bytes]
     asset_undo_infos = attr.ib(factory=list)  # type: List[Tuple[Sequence[bytes], int]]
 
 
 COMP_TXID_LEN = 4
+
+# Key prefix for futures locks, one record per type-7 transaction:
+#   FUTURES_PREFIX + tx_num(TXNUM_LEN) -> maturity(4) + lock_time(4) + idx(2)
+# Chosen not to collide with the existing prefixes: b'u' (utxo), b'h' (hashX),
+# b'a' (asset), b'U'/b'V' (undo).
+FUTURES_PREFIX = b'f'
+FUTURES_RECORD_LEN = 10
+# lock_output_index of a type-7 transaction whose payload would not parse. Not
+# a real output index, so it cannot collide with one; it means EVERY output of
+# that transaction must be withheld.
+FUTURES_UNREADABLE = 0xffff
 
 
 class DB:
@@ -267,6 +281,7 @@ class DB:
         assert not flush_data.undo_infos
         assert not flush_data.asset_adds
         assert not flush_data.asset_deletes
+        assert not flush_data.futures_adds
         assert not flush_data.asset_undo_infos
         self.history.assert_flushed()
 
@@ -393,6 +408,13 @@ class DB:
         for key in sorted(flush_data.asset_deletes):
             batch_delete(key)
         flush_data.asset_deletes.clear()
+
+        # Futures locks. Keyed by tx_num and NOT deleted when an output is
+        # spent: the record describes a transaction, which does not change.
+        # See BlockProcessor.futures_cache for why that shape was chosen.
+        for tx_numb, lock in flush_data.futures_adds.items():
+            batch_put(FUTURES_PREFIX + tx_numb, lock)
+        flush_data.futures_adds.clear()
 
         # New undo information
         self.flush_undo_infos(batch_put, flush_data.undo_infos)
@@ -890,6 +912,90 @@ class DB:
             self.logger.warning('all_utxos: tx hash not '
                                 'found (reorg?), retrying...')
             await sleep(0.25)
+
+    def is_coinbase_utxo(self, tx_num, height):
+        '''True when this output came from its block's coinbase transaction.
+
+        DERIVED, NOT STORED. The coinbase is the first transaction of its
+        block, tx_nums are assigned in block order, and tx_counts[h-1] is
+        already the first tx_num of block h -- fs_tx_hashes_at_blockheight
+        computes exactly this. So the flag costs one array lookup and needs no
+        index change and no reindex.
+
+        Worth having because consensus will not let anyone spend a coinbase
+        under COINBASE_MATURITY confirmations, and this index offers immature
+        ones as ordinary unspent money. A wallet that selects one builds a
+        transaction the network refuses.
+
+        A mempool UTXO carries height 0, and so does the genesis coinbase --
+        which is unspendable by consensus and never reaches this set. One
+        guard covers both, and it is not cosmetic: height 0 falling through
+        would read tx_counts[-1], which is the CHAIN TIP's cumulative count,
+        and answer True for any output whose tx_num happened to equal it.
+        '''
+        if height <= 0 or height >= len(self.tx_counts):
+            return False
+
+        return tx_num == self.tx_counts[height - 1]
+
+    async def futures_locks(self, tx_nums):
+        '''Return {tx_num: (maturity, lock_time, lock_output_index)} for those
+        of `tx_nums` that belong to a futures transaction.
+
+        A point get per tx_num rather than a prefix scan: the caller holds a
+        handful of UTXOs and almost none of them are futures, so a scan would
+        read every futures record on the chain to answer about three.
+
+        maturity and lock_time are None where the payload disabled them.
+        lock_output_index is FUTURES_UNREADABLE when the payload would not
+        parse, which means every output of that transaction is withheld.
+        '''
+        def read_locks():
+            locks = {}
+            get = self.utxo_db.get
+            for tx_num in tx_nums:
+                if tx_num < 0:
+                    continue
+                raw = get(FUTURES_PREFIX + pack_le_uint64(tx_num)[:TXNUM_LEN])
+                if raw is None or len(raw) < FUTURES_RECORD_LEN:
+                    continue
+                maturity, = unpack_le_int32_from(raw, 0)
+                lock_time, = unpack_le_int32_from(raw, 4)
+                lock_idx, = unpack_le_uint16_from(raw, 8)
+                locks[tx_num] = (maturity if maturity >= 0 else None,
+                                 lock_time if lock_time >= 0 else None,
+                                 lock_idx)
+
+            return locks
+
+        return await run_in_thread(read_locks)
+
+    def delete_futures_from(self, tx_count):
+        '''Delete futures records for tx_nums at or above `tx_count`.
+
+        Called on a reorg. tx_nums below the new tip keep their meaning; those
+        at or above it are reassigned to whatever transactions land there next,
+        and a stale record would attach somebody's lock to an unrelated output.
+
+        A full scan of the prefix rather than a range delete: the key packs
+        tx_num little-endian, matching every other key in this DB, so keys do
+        not sort by tx_num. Futures transactions are sparse and reorgs are rare,
+        so a scan of the whole prefix is the cheaper thing to keep simple.
+        '''
+        txnum_padding = bytes(8 - TXNUM_LEN)
+        stale = []
+        for key, _value in self.utxo_db.iterator(prefix=FUTURES_PREFIX):
+            tx_num, = unpack_le_uint64(key[-TXNUM_LEN:] + txnum_padding)
+            if tx_num >= tx_count:
+                stale.append(key)
+        if not stale:
+            return 0
+
+        with self.utxo_db.write_batch() as batch:
+            for key in stale:
+                batch.delete(key)
+
+        return len(stale)
 
     async def all_asset_utxos(self, hashX):
         '''Return all asset UTXOs for an address.

@@ -36,6 +36,7 @@ from electrumx.lib.hash import (HASHX_LEN, Base58Error, hash_to_hex_str,
 from electrumx.lib.merkle import MerkleCache
 from electrumx.lib.text import sessions_lines
 from electrumx.server.daemon import DaemonError
+from electrumx.server.db import FUTURES_UNREADABLE
 from electrumx.server.transport import PaddedRSTransport
 
 if TYPE_CHECKING:
@@ -1274,9 +1275,18 @@ class ElectrumX(SessionBase):
         self.bump_cost(1.0 + len(utxos) / 50)
         spends = await self.mempool.potential_spends(hashX)
 
+        # `is_coinbase` COSTS ONE ARRAY LOOKUP and answers a question this
+        # index could not otherwise be asked. Consensus refuses a coinbase
+        # spend under COINBASE_MATURITY confirmations, and without this flag a
+        # client has to fetch each funding transaction to find out -- one round
+        # trip per unspent output, which is why such clients end up capping
+        # how many outputs they will check.
+        is_coinbase = self.db.is_coinbase_utxo
+
         return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
                  'tx_pos': utxo.tx_pos,
-                 'height': utxo.height, 'value': utxo.value}
+                 'height': utxo.height, 'value': utxo.value,
+                 'is_coinbase': is_coinbase(utxo.tx_num, utxo.height)}
                 for utxo in utxos
                 if (utxo.tx_hash, utxo.tx_pos) not in spends]
 
@@ -2233,6 +2243,72 @@ class RaptoreumElectrumX(DashElectrumX):
                 cache[asset_id] = fields
 
         return {a: cache[a] for a in asset_ids if a in cache}
+
+    async def hashX_listunspent(self, hashX):
+        '''Unspent outputs, each carrying why it may NOT be ordinary money.
+
+        THE POINT: a client can decide spendability from this alone. Three
+        things make a Raptoreum output something other than spendable coin, and
+        all three were previously invisible here -- so a client had to fetch
+        the funding transaction of EVERY unspent output to find out, one round
+        trip each, and cap how many it checked, because a payout address with
+        10,480 of them is 10,000 round trips to answer one request.
+
+          - `is_coinbase`, from the base class, derived from tx_counts;
+          - `asset`, from the asset index this fork already writes, which the
+            plain UTXO index cannot express: an asset output carries zero RTM
+            and is otherwise indistinguishable from dust, and spending one as
+            a fee destroys somebody's holding;
+          - `lock`, a futures lock, which consensus enforces
+            (bad-txns-premature-spend-of-future) and which nothing else here
+            withholds.
+
+        `lock` is reported WITHOUT deciding whether it has released. That needs
+        the funding block's timestamp for the lockTime condition, and the
+        header offset it sits at is not the same across coins -- guessing it
+        would silently mis-date somebody's lock. Naming which outputs are
+        locked is enough: the client fetches funding transactions for those
+        alone, and there are almost never any.
+        '''
+        utxos = await super().hashX_listunspent(hashX)
+        if not utxos:
+            return utxos
+
+        assets = {(u.tx_hash, u.tx_pos): u for u in await self.db.all_asset_utxos(hashX)}
+        names = await self._asset_metadata({u.asset_id for u in assets.values()})
+
+        # Keyed by tx_num, so this asks about each funding transaction once
+        # however many of its outputs the address holds.
+        by_txid = {}
+        for utxo in await self.db.all_utxos(hashX):
+            by_txid[hash_to_hex_str(utxo.tx_hash)] = utxo.tx_num
+        locks = await self.db.futures_locks(set(by_txid.values()))
+
+        for entry in utxos:
+            asset = assets.get((hex_str_to_hash(entry['tx_hash']), entry['tx_pos']))
+            if asset is not None:
+                meta = names.get(asset.asset_id, {})
+                entry['asset'] = {'asset_id': asset.asset_id,
+                                  'name': meta.get('name'),
+                                  'decimal_point': meta.get('decimalPoint'),
+                                  'flag': asset.flag,
+                                  'unique_id': asset.unique_id,
+                                  'amount': asset.amount}
+
+            lock = locks.get(by_txid.get(entry['tx_hash'], -1))
+            if lock is None:
+                continue
+            maturity, lock_time, lock_idx = lock
+            # An unreadable payload locks every output of the transaction, not
+            # one: we cannot say which, and offering the rest is a guess about
+            # coins consensus may refuse to move.
+            unreadable = lock_idx == FUTURES_UNREADABLE
+            if unreadable or lock_idx == entry['tx_pos']:
+                entry['lock'] = {'maturity': maturity,
+                                 'locktime': lock_time,
+                                 'readable': not unreadable}
+
+        return utxos
 
     async def scripthash_listassets(self, scripthash):
         '''Return asset UTXOs for a scripthash.
