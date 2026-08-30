@@ -2,6 +2,8 @@
 '''Check the futures index against the daemon, in both directions.
 
     contrib/verify_futures_index.py <instance> [--scan N] [--scan-from HEIGHT]
+    contrib/verify_futures_index.py <instance> --dump FILE          # server stopped, seconds
+    contrib/verify_futures_index.py <instance> --check FILE [--from H] [--to H]
 
 STOP THE SERVER FIRST -- LevelDB admits one process:
 
@@ -33,6 +35,18 @@ passes whatever the index does. This prints the height distribution of the
 records it holds so the scan can be aimed with --scan-from, and refuses to
 call an empty reverse pass a result.
 
+A FULL-RANGE REVERSE SCAN WITHOUT THE OUTAGE. The reverse pass needs two
+things: the txids the index holds, and a walk of the chain. Only the first
+touches LevelDB. `--dump` writes them to a file in seconds with the server
+stopped; `--check` then walks the daemon against that file with the server
+running normally. That turns a million-block scan from a long outage into a
+few seconds of downtime plus a background job.
+
+    sudo systemctl stop electrumx@rtm
+    ... --dump /tmp/rtm-futures.json
+    sudo systemctl start electrumx@rtm
+    ... --check /tmp/rtm-futures.json --from 420420
+
 Read-only against both the database and the daemon.
 '''
 import asyncio
@@ -45,6 +59,10 @@ import urllib.parse
 import urllib.request
 
 CONF_DIR = os.environ.get('ELECTRUMX_CONF_DIR', '/etc/electrumx')
+
+
+def arg_value(flag):
+    return sys.argv[sys.argv.index(flag) + 1] if flag in sys.argv else None
 
 
 def load_conf(instance):
@@ -101,7 +119,35 @@ async def main():
         scan_from = int(sys.argv[sys.argv.index('--scan-from') + 1])
         scan = scan or 50000
 
+    dump_to = arg_value('--dump')
+    check_file = arg_value('--check')
+
     values = load_conf(instance)
+
+    if check_file:
+        # No database access at all, so the server can stay up.
+        held = json.load(open(check_file))
+        rpc = rpc_caller(values['DAEMON_URL'])
+        low = int(arg_value('--from') or 1)
+        high = int(arg_value('--to') or rpc('getblockcount', []))
+        print(f'checking {high:,d} down to {low:,d} against {len(held):,d} '
+              f'records dumped from {check_file}', flush=True)
+        seen = missing = 0
+        for height in range(high, low - 1, -1):
+            for tx in rpc('getblock', [rpc('getblockhash', [height]), 2])['tx']:
+                if tx.get('type') != 7:
+                    continue
+                seen += 1
+                if tx['txid'] not in held:
+                    missing += 1
+                    print(f'  MISSING {tx["txid"]} at height {height:,d}')
+            if height % 20000 == 0:
+                print(f'  ... {height:,d}  ({seen:,d} found so far)', flush=True)
+        print(f'\n{seen:,d} type-7 transactions in range, {missing:,d} with no record')
+        print('RESULT:', 'OK' if not missing else f'{missing} MISSING -- do not trust `lock`')
+
+        return 1 if missing else 0
+
     try:
         from electrumx.server.db import DB, FUTURES_PREFIX, FUTURES_UNREADABLE
         from electrumx.server.env import Env
@@ -166,6 +212,16 @@ async def main():
             print(f'  MISMATCH {txid} h={height:,d}\n    index  {mine}\n    daemon {theirs}')
     print(f'forward: {checked:,d} checked against the daemon, {mismatched:,d} mismatched, '
           f'{unreadable:,d} recorded unreadable')
+
+    if dump_to:
+        with open(dump_to, 'w') as handle:
+            json.dump({txid: list(lock) for txid, lock in by_txid.items()}, handle)
+        print(f'wrote {len(by_txid):,d} txids to {dump_to} -- '
+              f'restart the server, then re-run with --check {dump_to}')
+        db.utxo_db.close()
+        db.history.close_db()
+
+        return 0
 
     if heights:
         heights.sort()
