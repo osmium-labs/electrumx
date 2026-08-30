@@ -241,6 +241,38 @@ class History:
                 yield tx_num
                 limit -= 1
 
+    def get_txnums_newest_first(self, hashX, limit=1000, *, before=None):
+        '''Generator that yields tx_nums in the history of a hashX, NEWEST
+        FIRST -- the reverse of get_txnums, and the order a wallet reads.
+
+        `before` yields only tx_nums strictly less than it, which is what makes
+        a page boundary stable.  tx_nums are assigned in block order and are
+        never renumbered outside a reorg, so a page asked for again after new
+        blocks have arrived returns the same entries rather than sliding by the
+        number of new ones -- which is the failure an offset would have.
+
+        SKIPPING IS DELIBERATELY CHEAP, and it is the reason this exists rather
+        than a reversed() around the caller.  A skipped tx_num costs one
+        unpack; turning one into a tx_hash costs a read from the hashes file,
+        and only the ones actually yielded are ever turned into hashes.
+
+        Rows are visited in reverse key order and each row is walked backwards.
+        The key suffix is a BIG-endian flush id, so lexicographic key order is
+        numeric order, and tx_nums are appended to a row in increasing order --
+        both directions therefore reverse cleanly.
+        '''
+        limit = util.resolve_limit(limit)
+        txnum_padding = bytes(8-TXNUM_LEN)
+        for _key, hist in self.db.iterator(prefix=hashX, reverse=True):
+            for offset in range(len(hist) - TXNUM_LEN, -1, -TXNUM_LEN):
+                if limit == 0:
+                    return
+                tx_num, = unpack_le_uint64(hist[offset:offset+TXNUM_LEN] + txnum_padding)
+                if before is not None and tx_num >= before:
+                    continue
+                yield tx_num
+                limit -= 1
+
     #
     # History compaction
     #

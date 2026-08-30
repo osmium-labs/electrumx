@@ -50,6 +50,12 @@ if TYPE_CHECKING:
 BAD_REQUEST = 1
 DAEMON_ERROR = 2
 
+# Largest page blockchain.scripthash.get_history_page will serve.  A page is
+# what a wallet renders, so this is generous rather than tuned; the ceiling
+# that matters is env.max_send, and 1000 entries is about 99 KB of them.  A
+# client wanting more than this wants get_history, which is still there.
+MAX_HISTORY_PAGE = 1000
+
 
 def scripthash_to_hashX(scripthash):
     try:
@@ -839,6 +845,20 @@ class SessionManager:
             raise result
         return result, cost
 
+    async def limited_history_page(self, hashX, *, limit, before):
+        '''Returns (history, cursor, cost) for one page, newest first.
+
+        NOT CACHED, where limited_history is.  That cache holds one entry per
+        hashX and is invalidated when a block touches it; a page cache would
+        need a key per (hashX, cursor, limit) and the same invalidation, and it
+        would be buying back a read this method has already made small.  The
+        cost it saves on the cached path is a few dozen reads from the hashes
+        file, against the entire history being walked, serialised and sent.
+        '''
+        history, cursor = await self.db.limited_history_page(
+            hashX, limit=limit, before=before)
+        return history, cursor, 0.1 + len(history) * 0.001
+
     async def _notify_sessions(self, height, touched):
         '''Notify sessions about height changes and touched addresses.'''
         height_changed = height != self.notified_height
@@ -1301,6 +1321,52 @@ class ElectrumX(SessionBase):
         hashX = scripthash_to_hashX(scripthash)
         return await self.confirmed_and_unconfirmed_history(hashX)
 
+    async def scripthash_get_history_page(self, scripthash, count=100, cursor=None):
+        '''One page of a scripthash's history, NEWEST FIRST.
+
+        WHY THIS EXISTS.  blockchain.scripthash.get_history has no paged form:
+        it returns the address's entire confirmed history on every call, and
+        every entry costs a read from the hashes file to produce and about 99
+        bytes to send.  A wallet showing twenty rows of a twenty-thousand
+        transaction address pays for all twenty thousand, on every poll.  Past
+        env.max_send // 99 entries it pays for nothing at all -- the entire
+        history is refused as 'history too large', so the busiest addresses are
+        the ones that do not work.
+
+        Returns {'history': [...], 'cursor': str|None}.  The list is the same
+        entry shape get_history returns, newest first.  `cursor` is opaque:
+        pass it back as `cursor` for the next page, and None means this page
+        reached the end.  It is not an offset, deliberately -- an offset slides
+        by however many transactions confirmed between two requests, so paging
+        through a busy address would show entries twice and skip others.
+
+        MEMPOOL ENTRIES APPEAR ON THE FIRST PAGE ONLY, ahead of the confirmed
+        ones, because that is where an unconfirmed transaction belongs in a
+        newest-first list.  They are not paged: the mempool has no stable
+        ordering to page over, and there are never many.
+        '''
+        hashX = scripthash_to_hashX(scripthash)
+        count = non_negative_integer(count)
+        if not 1 <= count <= MAX_HISTORY_PAGE:
+            raise RPCError(BAD_REQUEST, f'count must be between 1 and '
+                                        f'{MAX_HISTORY_PAGE:,d}')
+        before = None
+        if cursor is not None:
+            try:
+                before = non_negative_integer(cursor)
+            except (RPCError, ValueError):
+                raise RPCError(BAD_REQUEST, f'invalid cursor: {cursor}') from None
+
+        history, next_cursor, cost = await self.session_mgr.limited_history_page(
+            hashX, limit=count, before=before)
+        self.bump_cost(cost)
+        conf = [{'tx_hash': hash_to_hex_str(tx_hash), 'height': height}
+                for tx_hash, height in history]
+        unconf = [] if before is not None else await self.unconfirmed_history(hashX)
+
+        return {'history': unconf + conf,
+                'cursor': None if next_cursor is None else str(next_cursor)}
+
     async def scripthash_get_mempool(self, scripthash):
         '''Return the mempool transactions touching a scripthash.'''
         hashX = scripthash_to_hashX(scripthash)
@@ -1712,6 +1778,7 @@ class ElectrumX(SessionBase):
             'blockchain.headers.subscribe': self.headers_subscribe,
             'blockchain.scripthash.get_balance': self.scripthash_get_balance,
             'blockchain.scripthash.get_history': self.scripthash_get_history,
+            'blockchain.scripthash.get_history_page': self.scripthash_get_history_page,
             'blockchain.scripthash.get_mempool': self.scripthash_get_mempool,
             'blockchain.scripthash.listunspent': self.scripthash_listunspent,
             'blockchain.scripthash.subscribe': self.scripthash_subscribe,

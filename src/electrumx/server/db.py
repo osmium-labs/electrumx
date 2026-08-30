@@ -570,6 +570,49 @@ class DB:
                                 'not found (reorg?), retrying...')
             await sleep(0.25)
 
+    async def limited_history_page(self, hashX, *, limit, before=None):
+        '''Return a pair (history, cursor).
+
+        History is a list of (tx_hash, height) tuples for confirmed
+        transactions that touched the address, NEWEST FIRST -- the reverse of
+        limited_history, and at most `limit` of them.
+
+        `cursor` is the tx_num to pass as `before` for the next page, or None
+        when this page reached the end of the history.  It is a tx_num rather
+        than a position because tx_nums do not move when new blocks arrive: an
+        offset would slide by the number of transactions confirmed between two
+        requests, so a client paging through a busy address would see entries
+        twice and miss others.
+
+        THE READ IS BOUNDED BY `limit`, NOT BY THE SIZE OF THE HISTORY, which
+        is the whole point.  limited_history resolves every tx_num it walks
+        into a tx_hash -- a read from the hashes file each -- and an address
+        with twenty thousand transactions pays for twenty thousand of them to
+        serve the twenty a wallet shows.
+        '''
+        def read_history():
+            # One more than asked for, to learn whether there is a next page
+            # without a second query.  It is discarded before returning.
+            tx_nums = list(self.history.get_txnums_newest_first(
+                hashX, limit + 1, before=before))
+            more = len(tx_nums) > limit
+            tx_nums = tx_nums[:limit]
+            fs_tx_hash = self.fs_tx_hash
+            history = [fs_tx_hash(tx_num) for tx_num in tx_nums]
+            cursor = tx_nums[-1] if more and tx_nums else None
+            return history, cursor
+
+        while True:
+            history, cursor = await run_in_thread(read_history)
+            if all(hash is not None for hash, height in history):
+                return history, cursor
+            # A tx_num that resolves to no hash means the block it was in went
+            # away between the walk and the read.  Same retry as
+            # limited_history, and for the same reason.
+            self.logger.warning('limited_history_page: tx hash '
+                                'not found (reorg?), retrying...')
+            await sleep(0.25)
+
     # -- Undo information
 
     def min_undo_height(self, max_height):
