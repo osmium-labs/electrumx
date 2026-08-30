@@ -138,8 +138,12 @@ cat <<NEXT
 
   Watch:     journalctl -fu $unit
   Rollback:  $0 $instance --rollback
-  Verify:    python3 contrib/check_spendability.py $instance <address> [address...]
   Reclaim:   $0 $instance --discard-backup
+
+  Verify (the one that matters -- needs the server stopped briefly):
+    sudo systemctl stop $unit
+    python3 contrib/verify_futures_index.py $instance --scan 50000
+    sudo systemctl start $unit
 
   Note the time above -- how long this takes decides whether mainnet is a
   full resync or worth writing a targeted backfill for.

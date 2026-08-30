@@ -132,6 +132,39 @@ def test_a_longer_payload_still_parses():
     assert Raptoreum.parse_futures_payload(payload() + b'\x00' * 16) == (100, None, 1)
 
 
+# A REAL ONE, and the reason this section is not only synthetic payloads.
+#
+# Mainnet txid a4e09d74…bd3fb0e3 at height 426,615 -- a few blocks after
+# futures activated at 420,420. 84 bytes, because CFutureTx carries six more
+# fields after `fee` (updatableByDestination, exChainType,
+# externalPayoutAddress, externalTxid, externalConfirmations, inputsHash) that
+# nothing here reads.
+#
+# The daemon's own decode of this payload is
+#   {"version": 1, "maturity": -1, "lockTime": 300, "lockOutputIndex": 1, "fee": 100}
+# and the transaction has two outputs: vout 0 is 0.00999835 change, vout 1 is
+# the 10 RTM that was locked. A payload built to match the code that reads it
+# proves the code is self-consistent; this proves it agrees with Raptoreum.
+REAL_MAINNET_FUTURES = bytes.fromhex(
+    '0100ffffffff2c010000010064000000000000000000000000000000000000000000000000'
+    '000000000000000000000000000000c82c802446ced69cce9831a9fc4ff728b382af9208f1'
+    '782369304a3c6b6de234')
+
+
+def test_agrees_with_the_daemon_on_a_real_mainnet_payload():
+    maturity, lock_time, lock_idx = Raptoreum.parse_futures_payload(REAL_MAINNET_FUTURES)
+
+    assert maturity is None      # daemon: -1, meaning the block condition is off
+    assert lock_time == 300      # daemon: 300 seconds from first confirmation
+    assert lock_idx == 1         # daemon: output 1, the 10 RTM; output 0 is change
+
+
+def test_the_real_payloads_change_output_is_not_the_locked_one():
+    # The half that is easy to get right by accident and expensive to get
+    # wrong: assuming output 0 releases the locked coins and strands the change.
+    assert Raptoreum.parse_futures_payload(REAL_MAINNET_FUTURES)[2] != 0
+
+
 # ---------------------------------------------------------------------------
 # The futures index
 # ---------------------------------------------------------------------------
